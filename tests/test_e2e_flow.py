@@ -565,3 +565,98 @@ class TestPerformance:
         
         # Allow generous margin for test environment
         assert elapsed_ms < 5000, f"Ingestion took {elapsed_ms}ms (target: <100ms)"
+
+
+class TestEventFirstIngestion:
+    """Tests for event-first (lossless) ingestion: every payload attempt is persisted."""
+
+    # Minimal malformed payload: missing required clinicalStatus, code, subject
+    MALFORMED_PAYLOAD = {
+        "resourceType": "Condition",
+        "id": "malformed-test-001",
+    }
+
+    # Minimal valid payload that passes Pydantic validation
+    VALID_PAYLOAD_STUB = {
+        "resourceType": "Condition",
+        "id": "stub-valid-001",
+        "clinicalStatus": {
+            "coding": [{"system": "http://terminology.hl7.org/CodeSystem/condition-clinical", "code": "55561003", "display": "Active"}],
+            "text": "Active",
+        },
+        "code": {
+            "coding": [{"system": "http://snomed.info/sct", "code": "73211009", "display": "Diabetes"}],
+            "text": "Diabetes mellitus",
+        },
+        "subject": {"reference": "Patient/test-patient"},
+    }
+
+    def test_ingestion_persists_invalid_payload_events(self, store):
+        """Malformed payloads must still appear as append-only events with failed_validation outcome."""
+        patient_id = "test-event-first-001"
+
+        result = store.ingest_raw_batch(
+            patient_id=patient_id,
+            raw_conditions=[self.MALFORMED_PAYLOAD, self.VALID_PAYLOAD_STUB],
+        )
+
+        # Both payloads must be recorded regardless of validity
+        event_rows = store.conn.execute(
+            "SELECT ingestion_outcome FROM condition_ingestion_events WHERE patient_id = ? ORDER BY created_at",
+            [patient_id],
+        ).fetchall()
+
+        assert len(event_rows) == 2, f"Expected 2 events, got {len(event_rows)}"
+        outcomes = {row[0] for row in event_rows}
+        assert "failed_validation" in outcomes
+        assert "parsed" in outcomes
+        # Only the valid one should appear in the live representation
+        live = store.query_current_conditions(patient_id)
+        assert len(live) == 1
+        assert live[0]["condition_id"] == "stub-valid-001"
+
+    def test_ingestion_records_parse_error_metadata(self, store):
+        """Failed-validation events must include auditable error_detail JSON metadata."""
+        patient_id = "test-event-first-002"
+
+        store.ingest_raw_batch(
+            patient_id=patient_id,
+            raw_conditions=[self.MALFORMED_PAYLOAD],
+        )
+
+        row = store.conn.execute(
+            "SELECT error_detail, ingestion_outcome FROM condition_ingestion_events WHERE patient_id = ?",
+            [patient_id],
+        ).fetchone()
+
+        assert row is not None
+        assert row[1] == "failed_validation"
+        import json as _json
+        error_detail = _json.loads(row[0])
+        assert "error_type" in error_detail
+        assert "error_message" in error_detail
+        assert "source_stage" in error_detail
+
+    def test_event_count_equals_all_attempted_payloads(self, store, sample_conditions):
+        """total events persisted must equal total payloads attempted (valid + invalid)."""
+        patient_id = "test-event-first-003"
+        all_conditions = sample_conditions["all"]
+
+        # Inject 3 malformed payloads alongside the real dataset
+        malformed_batch = [
+            {"resourceType": "Condition", "id": f"bad-{i}"} for i in range(3)
+        ]
+        mixed_batch = malformed_batch + all_conditions
+
+        result = store.ingest_raw_batch(
+            patient_id=patient_id,
+            raw_conditions=mixed_batch,
+        )
+
+        stats = store.get_ingestion_event_stats(patient_id)
+
+        assert stats["total_attempted"] == len(mixed_batch)
+        assert stats["failed_validation"] == 3
+        assert stats["parsed"] == len(all_conditions)
+        assert result["conditions_failed"] == 3
+        assert result["conditions_ingested"] == len(all_conditions)

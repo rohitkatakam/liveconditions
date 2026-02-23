@@ -1,7 +1,9 @@
 """Tests for HANDOUT.md requirements."""
 import json
+import uuid
 import pytest
 from src.parser import ConditionParser
+from src.storage import ConditionStore
 
 
 class TestHandoutRequirements:
@@ -225,3 +227,36 @@ class TestHandoutRequirements:
 
         # System can report on failures
         assert results["failed"] == 0  # No failures for this data
+
+    def test_requirement_monitoring_raw_event_tracing(self, conditions_data):
+        """
+        Requirement: Monitoring - event store must account for every attempted payload,
+        including those that fail validation, so the system can answer what it ingested
+        or died on.
+        """
+        patient_id = "monitoring-raw-events-patient"
+        store = ConditionStore()
+        try:
+            # Inject one malformed payload alongside the real dataset
+            malformed = [{"resourceType": "Condition", "id": "malformed-monitoring-001"}]
+            result = store.ingest_raw_batch(
+                patient_id=patient_id,
+                raw_conditions=malformed + conditions_data,
+            )
+
+            stats = store.get_ingestion_event_stats(patient_id)
+
+            # Every attempted payload is accounted for in the event store
+            assert stats["total_attempted"] == len(conditions_data) + 1
+            assert stats["failed_validation"] == 1
+            assert stats["parsed"] == len(conditions_data)
+
+            # The result dict surfaces the split so callers can monitor failures
+            assert result["conditions_failed"] == 1
+            assert result["conditions_ingested"] == len(conditions_data)
+
+            # Failed payloads are NOT in the live representation
+            live = store.query_current_conditions(patient_id)
+            assert not any(c["condition_id"] == "malformed-monitoring-001" for c in live)
+        finally:
+            store.close()
