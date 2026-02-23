@@ -1,5 +1,7 @@
 """End-to-end tests for event sourcing and correction flow."""
 import json
+import time
+import threading
 import uuid
 import pytest
 import logging
@@ -7,7 +9,7 @@ from datetime import datetime
 
 from src.parser import ConditionParser
 from src.models import ConditionValidator
-from src.storage import ConditionStore
+from src.storage import ConditionStore, BackgroundIngestionWorker, IngestionJob
 from src.mcp_tools import ConditionTools
 
 
@@ -955,3 +957,391 @@ class TestCanonicalIngestion:
 
         live = store.query_current_conditions(patient_id)
         assert len(live) == 0
+
+
+class TestAsyncIngestionContract:
+    """Tests that define the async background-ingestion API contract.
+
+    Phase 1: Written to FAIL because the async APIs don't exist yet.
+    These tests will pass once Phase 2+3 implementation is complete.
+    """
+
+    @pytest.fixture
+    def sample_conditions(self):
+        """Load sample FHIR conditions from conditions.json."""
+        with open("conditions.json") as f:
+            data = json.load(f)
+        all_conditions = data if isinstance(data, list) else data.get("conditions", [])
+        mid = len(all_conditions) // 2
+        return {
+            "all": all_conditions,
+            "day1": all_conditions[:mid],
+            "day2": all_conditions[mid:],
+        }
+
+    def test_ingest_raw_batch_remains_synchronous_default_contract(
+        self, sample_conditions
+    ):
+        """Sync ingest_raw_batch must still work without starting any background worker.
+
+        This test should PASS and will detect if the sync path breaks.
+        """
+        patient_id = "async-contract-sync-001"
+        store = ConditionStore()
+        try:
+            result = store.ingest_raw_batch(patient_id, sample_conditions["day1"])
+            # Synchronous path: data must be immediately queryable
+            conditions = store.query_current_conditions(patient_id)
+            assert len(conditions) > 0
+            assert result["status"] == "success"
+        finally:
+            store.close()
+
+    def test_background_ingestion_enqueue_returns_without_waiting_for_projection(
+        self, sample_conditions
+    ):
+        """enqueue_raw_batch must return quickly with a 'queued'/'enqueued' status.
+
+        MUST FAIL: start_background_worker / enqueue_raw_batch don't exist yet.
+        """
+        patient_id = "async-contract-enqueue-001"
+        store = ConditionStore()
+        try:
+            store.start_background_worker()
+            raw_conditions = sample_conditions["day1"]
+            start = time.time()
+            result = store.enqueue_raw_batch(patient_id, raw_conditions)
+            elapsed = time.time() - start
+            # Must return quickly — well before full projection
+            assert elapsed < 1.0, f"enqueue_raw_batch took {elapsed:.3f}s, should be near-instant"
+            assert result.get("status") in ("queued", "enqueued"), (
+                f"Expected status 'queued' or 'enqueued', got: {result}"
+            )
+        finally:
+            store.stop_background_worker()
+            store.close()
+
+    def test_background_ingestion_flush_makes_enqueued_data_queryable(
+        self, sample_conditions
+    ):
+        """After flush_background_ingestion completes, enqueued data must be queryable.
+
+        MUST FAIL: flush_background_ingestion / enqueue_raw_batch don't exist yet.
+        """
+        patient_id = "async-contract-flush-001"
+        store = ConditionStore()
+        try:
+            store.start_background_worker()
+            store.enqueue_raw_batch(patient_id, sample_conditions["day1"])
+            # Block until all queued jobs finish
+            store.flush_background_ingestion(timeout=5.0)
+            conditions = store.query_current_conditions(patient_id)
+            assert len(conditions) > 0, "Conditions should be queryable after flush"
+        finally:
+            store.stop_background_worker()
+            store.close()
+
+    def test_reads_remain_available_while_background_ingestion_is_processing(
+        self, sample_conditions
+    ):
+        """Reads must not block while background worker is active.
+
+        MUST FAIL: start_background_worker doesn't exist yet.
+        """
+        patient_id = "async-contract-read-001"
+        store = ConditionStore()
+        try:
+            store.start_background_worker()
+            # Query a patient with no data — must return without error
+            conditions = store.query_current_conditions("no-data-patient-xyz")
+            assert isinstance(conditions, list)
+
+            # Enqueue then immediately query — must not block
+            store.enqueue_raw_batch(patient_id, sample_conditions["day1"])
+            query_start = time.time()
+            store.query_current_conditions(patient_id)
+            query_elapsed = time.time() - query_start
+            assert query_elapsed < 0.2, (
+                f"Query took {query_elapsed*1000:.1f}ms while background work pending (should be < 200ms)"
+            )
+        finally:
+            store.stop_background_worker()
+            store.close()
+
+    def test_issue_correction_works_while_background_jobs_are_pending(
+        self, sample_conditions
+    ):
+        """issue_correction must succeed even while background jobs are queued.
+
+        MUST FAIL: enqueue_raw_batch doesn't exist yet.
+        """
+        patient_id = "async-contract-correction-001"
+        store = ConditionStore()
+        try:
+            store.start_background_worker()
+            # Enqueue but do NOT flush
+            store.enqueue_raw_batch(patient_id, sample_conditions["day1"])
+            # Issue correction immediately, before flush
+            result = store.issue_correction(
+                patient_id=patient_id,
+                condition_code="tuberculosis",
+                reason="User says they do not have tuberculosis",
+            )
+            assert result["status"] == "success", (
+                f"issue_correction should succeed while bg jobs are pending: {result}"
+            )
+        finally:
+            store.stop_background_worker()
+            store.close()
+
+    def test_enqueue_raw_batch_requires_worker_started(self):
+        """enqueue_raw_batch must raise RuntimeError if worker was never started and fallback_to_sync=False."""
+        store = ConditionStore()
+        try:
+            with pytest.raises(RuntimeError, match="start_background_worker"):
+                store.enqueue_raw_batch("patient-no-worker", [{"id": "cond-1"}], fallback_to_sync=False)
+        finally:
+            store.close()
+
+    def test_background_worker_reuses_sync_ingestion_logic(self, sample_conditions):
+        """Background worker must call ingest_raw_batch logic, counting valid + failed events."""
+        patient_id = "async-logic-reuse-001"
+        store = ConditionStore()
+        try:
+            store.start_background_worker()
+            valid_condition = sample_conditions["day1"][0]
+            malformed_condition = {"not_a_fhir_field": "garbage", "id": "bad-001"}
+            store.enqueue_raw_batch(patient_id, [valid_condition, malformed_condition])
+            flushed = store.flush_background_ingestion(timeout=10.0)
+            assert flushed, "flush should complete within timeout"
+
+            stats = store.get_ingestion_event_stats(patient_id)
+            assert stats["parsed"] >= 1, f"Expected at least 1 parsed, got: {stats}"
+            assert stats["failed_validation"] >= 1, f"Expected at least 1 failed, got: {stats}"
+        finally:
+            store.stop_background_worker()
+            store.close()
+
+    def test_async_mode_reports_correct_job_counts_after_multiple_enqueues(self, sample_conditions):
+        """After 3 separate enqueues, jobs_processed and jobs_enqueued must both equal 3."""
+        patient_id = "async-job-counts-001"
+        store = ConditionStore()
+        try:
+            store.start_background_worker()
+            all_conditions = sample_conditions["all"]
+            batch1 = all_conditions[:5]
+            batch2 = all_conditions[5:10]
+            batch3 = all_conditions[10:15]
+            store.enqueue_raw_batch(patient_id, batch1)
+            store.enqueue_raw_batch(patient_id, batch2)
+            store.enqueue_raw_batch(patient_id, batch3)
+            flushed = store.flush_background_ingestion(timeout=10.0)
+            assert flushed, "flush should complete within timeout"
+            status = store.get_background_ingestion_status()
+            assert status["jobs_enqueued"] == 3, (
+                f"Expected jobs_enqueued=3, got: {status['jobs_enqueued']}"
+            )
+            assert status["jobs_processed"] == 3, (
+                f"Expected jobs_processed=3, got: {status['jobs_processed']}"
+            )
+        finally:
+            store.stop_background_worker()
+            store.close()
+
+
+class TestBackgroundIngestionWorker:
+    """Unit/integration tests for the standalone BackgroundIngestionWorker primitive."""
+
+    def test_background_worker_start_stop_idempotent(self):
+        """Starting twice and stopping twice must not raise or crash."""
+        worker = BackgroundIngestionWorker(process_fn=lambda job: {})
+        try:
+            worker.start()
+            worker.start()  # idempotent
+            assert worker.is_running
+        finally:
+            worker.stop()
+            worker.stop()  # idempotent
+        assert not worker.is_running
+
+    def test_background_worker_processes_enqueued_job(self):
+        """All enqueued jobs must be processed after flush."""
+        processed_ids = []
+        lock = threading.Lock()
+
+        def process_fn(job: IngestionJob) -> dict:
+            with lock:
+                processed_ids.append(job.batch_id)
+            return {"status": "ok"}
+
+        worker = BackgroundIngestionWorker(process_fn=process_fn)
+        try:
+            worker.start()
+            jobs = [
+                IngestionJob(patient_id="p1", raw_conditions=[], batch_id=f"job-{i}")
+                for i in range(3)
+            ]
+            for job in jobs:
+                worker.enqueue(job)
+            drained = worker.flush(timeout=5.0)
+            assert drained, "Queue should be fully drained within 5 s"
+            with lock:
+                for job in jobs:
+                    assert job.batch_id in processed_ids, (
+                        f"{job.batch_id} was not processed"
+                    )
+        finally:
+            worker.stop()
+
+    def test_background_worker_captures_failed_job_without_crashing(self):
+        """A job that raises must increment jobs_failed; worker keeps running."""
+        BAD_ID = "bad-job-id"
+
+        def process_fn(job: IngestionJob) -> dict:
+            if job.batch_id == BAD_ID:
+                raise RuntimeError("boom")
+            return {"status": "ok"}
+
+        worker = BackgroundIngestionWorker(process_fn=process_fn)
+        try:
+            worker.start()
+            worker.enqueue(IngestionJob(patient_id="p1", raw_conditions=[], batch_id=BAD_ID))
+            worker.enqueue(IngestionJob(patient_id="p1", raw_conditions=[], batch_id="good-1"))
+            worker.enqueue(IngestionJob(patient_id="p1", raw_conditions=[], batch_id="good-2"))
+            worker.flush(timeout=5.0)
+
+            status = worker.get_status()
+            assert status["jobs_failed"] >= 1
+            assert status["jobs_processed"] >= 2
+            assert status["last_error"] is not None
+            assert worker.is_running, "Worker must still be alive after a failed job"
+        finally:
+            worker.stop()
+
+    def test_background_worker_status_keys_present(self):
+        """get_status() must return all required health snapshot keys."""
+        required_keys = {
+            "worker_running",
+            "queue_depth",
+            "jobs_enqueued",
+            "jobs_processed",
+            "jobs_failed",
+            "last_error",
+            "last_processed_at",
+            "last_heartbeat",
+        }
+        worker = BackgroundIngestionWorker(process_fn=lambda job: {})
+        try:
+            worker.start()
+            status = worker.get_status()
+            missing = required_keys - status.keys()
+            assert not missing, f"Missing status keys: {missing}"
+        finally:
+            worker.stop()
+
+
+class TestAsyncFallback:
+    """Tests for graceful fallback from async to sync ingestion."""
+
+    @pytest.fixture
+    def sample_conditions(self):
+        """Load sample FHIR conditions."""
+        with open("conditions.json") as f:
+            data = json.load(f)
+        all_conditions = data if isinstance(data, list) else data.get("conditions", [])
+        return all_conditions[:5]
+
+    def test_disable_async_mode_preserves_existing_read_write_behavior(self, sample_conditions):
+        """Without starting worker, fallback_to_sync=True must ingest synchronously."""
+        patient_id = "fallback-no-worker-001"
+        store = ConditionStore()
+        try:
+            # Deliberately do NOT call start_background_worker
+            result = store.enqueue_raw_batch(patient_id, sample_conditions, fallback_to_sync=True)
+
+            assert result["status"] == "sync_fallback", f"Expected sync_fallback, got: {result['status']}"
+
+            # Conditions must be immediately queryable (sync path)
+            conditions = store.query_current_conditions(patient_id)
+            assert len(conditions) > 0, "Conditions should be queryable after sync fallback"
+
+            # Worker was never started
+            status = store.get_background_ingestion_status()
+            assert status["worker_running"] is False, "Worker should not be running"
+        finally:
+            store.close()
+
+    def test_async_mode_start_failure_falls_back_to_sync_ingestion(self, sample_conditions):
+        """After worker is stopped, fallback_to_sync=True must ingest synchronously."""
+        patient_id = "fallback-stopped-worker-001"
+        store = ConditionStore()
+        try:
+            store.start_background_worker()
+            store.stop_background_worker()
+
+            result = store.enqueue_raw_batch(patient_id, sample_conditions, fallback_to_sync=True)
+
+            assert result["status"] == "sync_fallback", f"Expected sync_fallback, got: {result['status']}"
+
+            conditions = store.query_current_conditions(patient_id)
+            assert len(conditions) > 0, "Conditions should be queryable after sync fallback"
+        finally:
+            store.close()
+
+    def test_queue_overflow_uses_sync_fallback_when_queue_full(self, sample_conditions):
+        """When worker queue is full, fallback_to_sync=True must ingest synchronously."""
+        patient_id = "fallback-queue-full-001"
+        store = ConditionStore()
+        try:
+            store.start_background_worker(max_queue_size=2)
+
+            # Fill the queue directly to capacity without going through enqueue_raw_batch
+            filler_job = IngestionJob(patient_id="dummy", raw_conditions=[])
+            store._worker._queue.put_nowait(filler_job)
+            store._worker._queue.put_nowait(filler_job)
+
+            # Queue is now full — enqueue_raw_batch must fall back to sync
+            result = store.enqueue_raw_batch(patient_id, sample_conditions, fallback_to_sync=True)
+
+            assert result["status"] == "sync_fallback", f"Expected sync_fallback, got: {result['status']}"
+
+            conditions = store.query_current_conditions(patient_id)
+            assert len(conditions) > 0, "Conditions should be queryable after sync fallback"
+        finally:
+            store.stop_background_worker()
+            store.close()
+
+    def test_consecutive_failure_warning_emitted_at_threshold(self, sample_conditions, caplog):
+        """Worker must emit warning when consecutive failures reach the threshold."""
+        patient_id = "fallback-consec-fail-001"
+        store = ConditionStore()
+        try:
+            store.start_background_worker(max_consecutive_failures=2)
+            # Close DB so every job raises
+            store.conn.close()
+
+            with caplog.at_level(logging.WARNING, logger="src.storage.duckdb_store"):
+                store.enqueue_raw_batch(patient_id, sample_conditions, fallback_to_sync=False)
+                store.enqueue_raw_batch(patient_id, sample_conditions, fallback_to_sync=False)
+                store.flush_background_ingestion(timeout=5.0)
+
+            warning_messages = [r.getMessage() for r in caplog.records]
+            warning_extras = [getattr(r, "consecutive_failures", None) for r in caplog.records]
+            assert any(
+                "consecutive_failure_threshold_reached" in msg for msg in warning_messages
+            ) or any(
+                cf is not None for cf in warning_extras
+            ), f"Expected consecutive_failure_threshold_reached warning. Records: {warning_messages}"
+        finally:
+            store.stop_background_worker()
+            # conn already closed; skip store.close()
+
+    def test_enqueue_with_fallback_false_raises_when_worker_not_started(self, sample_conditions):
+        """fallback_to_sync=False must raise RuntimeError when worker is not running."""
+        patient_id = "fallback-raises-001"
+        store = ConditionStore()
+        try:
+            with pytest.raises(RuntimeError):
+                store.enqueue_raw_batch(patient_id, sample_conditions, fallback_to_sync=False)
+        finally:
+            store.close()

@@ -1,12 +1,14 @@
 """DuckDB in-memory event store and live representation for condition data."""
 import json
 import logging
+import threading
 import uuid
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 import duckdb
 
 from src.models import ExtractedCondition, ConditionValidator
+from .async_ingestion import BackgroundIngestionWorker, IngestionJob
 
 
 logger = logging.getLogger(__name__)
@@ -25,6 +27,10 @@ class ConditionStore:
     def __init__(self):
         """Initialize in-memory DuckDB instance and create schema."""
         self.conn = duckdb.connect(":memory:")
+        self._db_lock = threading.RLock()
+        self._worker: Optional[BackgroundIngestionWorker] = None
+        self._consecutive_failures: int = 0
+        self._max_consecutive_failures: Optional[int] = None
         self._initialize_schema()
         logger.info("ConditionStore initialized with in-memory DuckDB")
 
@@ -415,24 +421,25 @@ class ConditionStore:
         """
         query = "SELECT * FROM current_conditions WHERE patient_id = ?"
         params = [patient_id]
-        
+
         if filters:
             if "status" in filters:
                 query += " AND clinical_status = ?"
                 params.append(filters["status"])
-            
+
             if "code_system" in filters:
                 query += " AND primary_code_system = ?"
                 params.append(filters["code_system"])
-            
+
             if "code" in filters:
                 query += " AND primary_code = ?"
                 params.append(filters["code"])
-        
+
         query += " ORDER BY extracted_at DESC"
-        
-        result = self.conn.execute(query, params).fetchall()
-        return self._rows_to_dicts(result, "current_conditions")
+
+        with self._db_lock:
+            result = self.conn.execute(query, params).fetchall()
+            return self._rows_to_dicts(result, "current_conditions")
 
     def query_active_conditions(self, patient_id: str) -> List[Dict]:
         """
@@ -485,59 +492,80 @@ class ConditionStore:
     def issue_correction(
         self,
         patient_id: str,
-        condition_ids: List[str],
+        condition_ids: Optional[List[str]] = None,
         correction_type: str = "EXCLUDE",
         reason: Optional[str] = None,
+        condition_code: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Issue a correction: append event to mask/exclude conditions.
+
+        Accepts either explicit ``condition_ids`` or a fuzzy ``condition_code`` that
+        is resolved against the current extracted conditions for the patient.
         
         Args:
             patient_id: Patient identifier
-            condition_ids: IDs of conditions to mask
+            condition_ids: IDs of conditions to mask (takes priority over condition_code)
             correction_type: 'EXCLUDE' or 'RETRACT'
             reason: Optional user rationale
+            condition_code: Free-text or code string; conditions whose code_text or
+                primary_code match (case-insensitive) will be masked
             
         Returns:
             Dictionary with correction details
         """
-        affected_count = 0
-        
-        try:
-            for condition_id in condition_ids:
-                event_id = uuid.uuid4()
-                
-                self.conn.execute("""
-                    INSERT INTO correction_events (
-                        event_id, patient_id, condition_id_to_mask,
-                        correction_type, correction_reason
-                    ) VALUES (?, ?, ?, ?, ?)
-                """, [str(event_id), patient_id, condition_id, correction_type, reason])
-                
-                affected_count += 1
-            
-            logger.info(
-                f"Issued correction for patient {patient_id}: {affected_count} conditions masked",
-                extra={
+        with self._db_lock:
+            # Resolve condition_ids from condition_code if needed
+            resolved_ids: List[str] = list(condition_ids) if condition_ids else []
+            if not resolved_ids and condition_code:
+                needle = condition_code.lower()
+                rows = self.conn.execute(
+                    "SELECT condition_id, code_text, primary_code FROM extracted_conditions_staging "
+                    "WHERE patient_id = ?",
+                    [patient_id],
+                ).fetchall()
+                for cid, code_text, primary_code in rows:
+                    if ((code_text and needle in code_text.lower()) or
+                            (primary_code and needle in primary_code.lower())):
+                        resolved_ids.append(cid)
+
+            affected_count = 0
+
+            try:
+                for condition_id in resolved_ids:
+                    event_id = uuid.uuid4()
+
+                    self.conn.execute("""
+                        INSERT INTO correction_events (
+                            event_id, patient_id, condition_id_to_mask,
+                            correction_type, correction_reason
+                        ) VALUES (?, ?, ?, ?, ?)
+                    """, [str(event_id), patient_id, condition_id, correction_type, reason])
+
+                    affected_count += 1
+
+                logger.info(
+                    f"Issued correction for patient {patient_id}: {affected_count} conditions masked",
+                    extra={
+                        "patient_id": patient_id,
+                        "affected_count": affected_count,
+                        "correction_type": correction_type,
+                    },
+                )
+
+                return {
+                    "status": "success",
                     "patient_id": patient_id,
-                    "affected_count": affected_count,
+                    "conditions_masked": affected_count,
                     "correction_type": correction_type,
-                },
-            )
-            
-            return {
-                "status": "success",
-                "patient_id": patient_id,
-                "conditions_masked": affected_count,
-                "correction_type": correction_type,
-            }
-        
-        except Exception as e:
-            logger.error(
-                f"Failed to issue correction: {str(e)}",
-                extra={"patient_id": patient_id, "error": str(e)},
-            )
-            raise
+                }
+
+            except Exception as e:
+                logger.error(
+                    f"Failed to issue correction: {str(e)}",
+                    extra={"patient_id": patient_id, "error": str(e)},
+                )
+                raise
 
     def get_condition_lineage(
         self,
@@ -824,8 +852,168 @@ class ConditionStore:
             "conditions_flagged": flagged_count,
         }
 
+    # -------------------------------------------------------------------------
+    # Background worker integration — opt-in async ingestion
+    # -------------------------------------------------------------------------
+
+    def start_background_worker(
+        self,
+        max_queue_size: int = 0,
+        max_consecutive_failures: Optional[int] = None,
+    ) -> None:
+        """Start the background ingestion worker. Idempotent."""
+        self._max_consecutive_failures = max_consecutive_failures
+        if self._worker is None:
+            self._worker = BackgroundIngestionWorker(
+                process_fn=self._execute_ingestion_job,
+                max_queue_size=max_queue_size,
+            )
+        self._worker.start()
+        logger.info(
+            "Background ingestion worker started",
+            extra={"max_queue_size": max_queue_size, "worker_running": self._worker.is_running},
+        )
+
+    def stop_background_worker(self, timeout: float = 5.0) -> None:
+        """Stop the background ingestion worker. Idempotent."""
+        if self._worker is not None:
+            self._worker.stop(timeout=timeout)
+            logger.info(
+                "Background ingestion worker stopped",
+                extra={"timeout": timeout},
+            )
+
+    def enqueue_raw_batch(
+        self,
+        patient_id: str,
+        raw_conditions: list,
+        batch_id=None,
+        on_complete=None,
+        fallback_to_sync: bool = True,
+    ) -> dict:
+        """Enqueue a raw batch for background ingestion.
+
+        When ``fallback_to_sync=True`` (default), if the worker is not running or
+        the queue is full the batch is ingested synchronously so no data is lost.
+        When ``fallback_to_sync=False`` and the worker is unavailable, a
+        ``RuntimeError`` is raised.
+        """
+        import queue as _queue_module
+
+        resolved_batch_id = uuid.uuid4() if batch_id is None else (
+            batch_id if isinstance(batch_id, uuid.UUID) else uuid.UUID(str(batch_id))
+        )
+
+        worker_available = self._worker is not None and self._worker.is_running
+
+        if not worker_available:
+            if not fallback_to_sync:
+                raise RuntimeError(
+                    "Background worker is not started. Call start_background_worker() first."
+                )
+            # Sync fallback — worker never started or has been stopped
+            logger.warning(
+                "async_worker_not_running_fell_back_to_sync",
+                extra={"patient_id": patient_id, "batch_id": str(resolved_batch_id)},
+            )
+            with self._db_lock:
+                result = self.ingest_raw_batch(
+                    patient_id=patient_id,
+                    raw_conditions=raw_conditions,
+                    batch_id=resolved_batch_id,
+                )
+            return {**result, "status": "sync_fallback"}
+
+        job = IngestionJob(
+            patient_id=patient_id,
+            raw_conditions=raw_conditions,
+            batch_id=str(resolved_batch_id),
+            on_complete=on_complete,
+        )
+        try:
+            self._worker.enqueue(job)
+        except _queue_module.Full:
+            if not fallback_to_sync:
+                raise RuntimeError(
+                    f"Background worker queue is full. "
+                    f"Increase max_queue_size or use fallback_to_sync=True."
+                ) from None
+            logger.warning(
+                "async_worker_queue_full_fell_back_to_sync",
+                extra={"patient_id": patient_id, "batch_id": str(resolved_batch_id)},
+            )
+            with self._db_lock:
+                result = self.ingest_raw_batch(
+                    patient_id=patient_id,
+                    raw_conditions=raw_conditions,
+                    batch_id=resolved_batch_id,
+                )
+            return {**result, "status": "sync_fallback"}
+
+        return {
+            "status": "queued",
+            "batch_id": job.batch_id,
+            "patient_id": patient_id,
+            "enqueued_count": len(raw_conditions),
+        }
+
+    def flush_background_ingestion(self, timeout: float = 10.0) -> bool:
+        """Block until all queued background jobs are processed. Returns True if fully drained."""
+        if self._worker is None or not self._worker.is_running:
+            return True
+        return self._worker.flush(timeout=timeout)
+
+    def get_background_ingestion_status(self) -> dict:
+        """Return health snapshot of the background worker."""
+        if self._worker is None:
+            return {
+                "mode": "sync",
+                "worker_running": False,
+                "queue_depth": 0,
+                "jobs_enqueued": 0,
+                "jobs_processed": 0,
+                "jobs_failed": 0,
+                "last_error": None,
+                "last_processed_at": None,
+                "last_heartbeat": None,
+            }
+        return {"mode": "async", **self._worker.get_status()}
+
+    def _execute_ingestion_job(self, job: IngestionJob) -> dict:
+        """Process one IngestionJob — called from the worker thread."""
+        try:
+            with self._db_lock:
+                result = self.ingest_raw_batch(
+                    patient_id=job.patient_id,
+                    raw_conditions=job.raw_conditions,
+                    batch_id=uuid.UUID(job.batch_id) if job.batch_id else None,
+                )
+            # Success — reset consecutive failure counter
+            self._consecutive_failures = 0
+            return result
+        except Exception:
+            self._consecutive_failures += 1
+            if (
+                self._max_consecutive_failures is not None
+                and self._consecutive_failures >= self._max_consecutive_failures
+            ):
+                logger.warning(
+                    "async_worker_consecutive_failure_threshold_reached",
+                    extra={
+                        "consecutive_failures": self._consecutive_failures,
+                        "threshold": self._max_consecutive_failures,
+                    },
+                )
+            raise
+
     def close(self):
         """Close the DuckDB connection."""
+        self.stop_background_worker()
+        if self._worker is not None and self._worker.is_running:
+            logger.warning(
+                "background_worker_still_alive_at_db_close",
+                extra={"note": "Worker did not stop within timeout; closing DB anyway"},
+            )
         if self.conn:
             self.conn.close()
             logger.info("ConditionStore connection closed")

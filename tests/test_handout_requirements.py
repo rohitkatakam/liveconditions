@@ -1,5 +1,6 @@
 """Tests for HANDOUT.md requirements."""
 import json
+import time
 import uuid
 import pytest
 from src.parser import ConditionParser
@@ -259,5 +260,189 @@ class TestHandoutRequirements:
             # Failed payloads are NOT in the live representation
             live = store.query_current_conditions(patient_id)
             assert not any(c["condition_id"] == "malformed-monitoring-001" for c in live)
+        finally:
+            store.close()
+
+    def test_requirement_latency_background_ingestion_does_not_block_reads(
+        self, conditions_data
+    ):
+        """
+        Requirement: Latency - reads must remain fast even while background ingestion
+        is processing a large batch.  The query must complete < 200 ms without waiting
+        for the ingestion to finish.
+
+        MUST FAIL: start_background_worker / enqueue_raw_batch don't exist yet.
+        """
+        patient_id = "0e3158f6-383d-40c6-acbf-62f187852934"
+        store = ConditionStore()
+        try:
+            store.start_background_worker()
+            # Enqueue all 105 conditions — large batch
+            store.enqueue_raw_batch(patient_id, conditions_data)
+            # Immediately query WITHOUT flushing/waiting
+            query_start = time.time()
+            result = store.query_current_conditions(patient_id)
+            query_elapsed = time.time() - query_start
+            # Must complete quickly even if zero results are returned
+            assert query_elapsed < 0.2, (
+                f"query_current_conditions blocked for {query_elapsed*1000:.1f}ms "
+                "while background ingestion was running (should be < 200ms)"
+            )
+            assert isinstance(result, list)
+        finally:
+            store.stop_background_worker()
+            store.close()
+
+    def test_requirement_monitoring_reports_background_worker_health(self):
+        """
+        Requirement: Monitoring - the system must expose background worker health
+        metrics so operators can observe queue depth and job outcomes.
+
+        MUST FAIL: get_background_ingestion_status / start_background_worker don't exist yet.
+        """
+        store = ConditionStore()
+        try:
+            store.start_background_worker()
+            status = store.get_background_ingestion_status()
+            required_keys = {
+                "worker_running",
+                "queue_depth",
+                "jobs_enqueued",
+                "jobs_processed",
+                "jobs_failed",
+            }
+            missing = required_keys - set(status.keys())
+            assert not missing, f"get_background_ingestion_status missing keys: {missing}"
+            assert status["worker_running"] is True
+        finally:
+            store.stop_background_worker()
+            store.close()
+
+
+class TestBackgroundObservability:
+    """Tests for background worker health and failure observability."""
+
+    @pytest.fixture
+    def conditions_data(self):
+        """Load conditions.json."""
+        with open("conditions.json") as f:
+            return json.load(f)
+
+    def test_background_monitoring_exposes_queue_depth_and_failure_counts(self):
+        """get_background_ingestion_status must expose all required monitoring keys."""
+        store = ConditionStore()
+        try:
+            store.start_background_worker()
+            status = store.get_background_ingestion_status()
+            required_keys = {"mode", "worker_running", "queue_depth", "jobs_enqueued", "jobs_processed", "jobs_failed"}
+            missing = required_keys - set(status.keys())
+            assert not missing, f"Missing keys: {missing}"
+            assert status["queue_depth"] == 0
+            assert status["jobs_failed"] == 0
+            assert status["worker_running"] is True
+        finally:
+            store.stop_background_worker()
+            store.close()
+
+    def test_background_monitoring_records_last_error_and_last_success_timestamp(self, conditions_data):
+        """Worker must track last_processed_at on success and last_error on failure."""
+        # Sub-scenario 1: success path
+        patient_id = "observability-success-001"
+        store1 = ConditionStore()
+        try:
+            store1.start_background_worker()
+            store1.enqueue_raw_batch(patient_id, conditions_data[:5])
+            store1.flush_background_ingestion(timeout=10.0)
+            status = store1.get_background_ingestion_status()
+            assert status["jobs_processed"] >= 1, f"Expected >=1 processed, got: {status}"
+            assert status["last_processed_at"] is not None, "last_processed_at should be set after success"
+        finally:
+            store1.stop_background_worker()
+            store1.close()
+
+        # Sub-scenario 2: failure path - close DuckDB connection so job raises
+        patient_id2 = "observability-fail-001"
+        store2 = ConditionStore()
+        try:
+            store2.start_background_worker()
+            store2.conn.close()
+            store2.enqueue_raw_batch(patient_id2, conditions_data[:3])
+            store2.flush_background_ingestion(timeout=3.0)
+            status2 = store2.get_background_ingestion_status()
+            assert status2["jobs_failed"] >= 1, f"Expected >=1 failed, got: {status2}"
+            assert status2["last_error"] is not None and status2["last_error"] != "", (
+                f"last_error should be non-empty, got: {status2['last_error']}"
+            )
+        finally:
+            store2.stop_background_worker()
+            # conn already closed; do not call store2.close()
+
+    def test_requirement_monitoring_background_worker_reports_died_on_payloads(self, conditions_data):
+        """In-batch validation failures do NOT increment jobs_failed."""
+        patient_id = "observability-mixed-001"
+        store = ConditionStore()
+        try:
+            store.start_background_worker()
+            malformed1 = {"not_fhir": "garbage1", "id": "bad-obs-001"}
+            malformed2 = {"not_fhir": "garbage2", "id": "bad-obs-002"}
+            mixed_batch = [malformed1, malformed2] + list(conditions_data)
+            store.enqueue_raw_batch(patient_id, mixed_batch)
+            store.flush_background_ingestion(timeout=10.0)
+
+            stats = store.get_ingestion_event_stats(patient_id)
+            assert stats["failed_validation"] == 2, (
+                f"Expected 2 failed_validation, got: {stats['failed_validation']}"
+            )
+            assert stats["parsed"] == len(conditions_data), (
+                f"Expected {len(conditions_data)} parsed, got: {stats['parsed']}"
+            )
+
+            bg_status = store.get_background_ingestion_status()
+            assert bg_status["jobs_processed"] >= 1, (
+                f"Worker should count whole batch as 1 job: {bg_status}"
+            )
+            assert bg_status["jobs_failed"] == 0, (
+                f"In-batch validation failures must not increment jobs_failed: {bg_status}"
+            )
+        finally:
+            store.stop_background_worker()
+            store.close()
+
+    def test_background_status_returns_sync_sentinel_when_worker_not_started(self):
+        """Without start_background_worker(), mode must be sync and worker_running False."""
+        store = ConditionStore()
+        try:
+            status = store.get_background_ingestion_status()
+            assert status["mode"] == "sync", f"Expected mode=sync, got: {status['mode']}"
+            assert status["worker_running"] is False
+            assert status["queue_depth"] == 0
+        finally:
+            store.close()
+
+    def test_fallback_sync_mode_ingestion_preserves_audit_trail(self, conditions_data):
+        """Sync fallback must persist audit events exactly like normal async path."""
+        patient_id = "fallback-audit-trail-001"
+        # Only use valid conditions (first 5 for speed)
+        valid_conditions = conditions_data[:5]
+        store = ConditionStore()
+        try:
+            # No worker started — fallback_to_sync=True invokes ingest_raw_batch directly
+            result = store.enqueue_raw_batch(
+                patient_id, valid_conditions, fallback_to_sync=True
+            )
+            assert result["status"] == "sync_fallback"
+
+            # Conditions are immediately visible in the live representation
+            conditions = store.query_current_conditions(patient_id)
+            assert len(conditions) > 0, "Conditions should be queryable after sync fallback"
+
+            # Audit trail must be intact
+            stats = store.get_ingestion_event_stats(patient_id)
+            assert stats["parsed"] == result.get("conditions_ingested", stats["parsed"]), (
+                f"Audit trail parsed count mismatch: stats={stats}, result={result}"
+            )
+            assert stats["total_attempted"] == len(valid_conditions), (
+                f"Expected {len(valid_conditions)} total_attempted, got {stats['total_attempted']}"
+            )
         finally:
             store.close()
