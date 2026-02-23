@@ -219,68 +219,7 @@ class ConditionStore:
             SELECT * FROM current_conditions
             WHERE clinical_status = 'Active'
         """)
-
-        # ========== RECONCILIATION: Internal artifact tables ==========
-
-        # Flat index mapping conditions to their codes (primary + alternative)
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS condition_code_index (
-                index_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                patient_id VARCHAR NOT NULL,
-                condition_id VARCHAR NOT NULL,
-                code_system VARCHAR NOT NULL,
-                code_value VARCHAR NOT NULL,
-                is_primary BOOLEAN NOT NULL DEFAULT TRUE,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        self.conn.execute("""
-            CREATE INDEX idx_code_index_patient_condition
-            ON condition_code_index(patient_id, condition_id)
-        """)
-        self.conn.execute("""
-            CREATE INDEX idx_code_index_patient_system_value
-            ON condition_code_index(patient_id, code_system, code_value)
-        """)
-
-        # One row per reconciliation group (canonical + metadata)
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS condition_reconciliation_groups (
-                group_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                patient_id VARCHAR NOT NULL,
-                canonical_condition_id VARCHAR NOT NULL,
-                is_ambiguous BOOLEAN NOT NULL DEFAULT FALSE,
-                decision_basis VARCHAR NOT NULL,
-                member_count INTEGER NOT NULL DEFAULT 1,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        self.conn.execute("""
-            CREATE INDEX idx_recon_groups_patient
-            ON condition_reconciliation_groups(patient_id)
-        """)
-
-        # One row per (group, condition_id) pair
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS condition_reconciliation_members (
-                member_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                group_id UUID NOT NULL,
-                patient_id VARCHAR NOT NULL,
-                condition_id VARCHAR NOT NULL,
-                is_canonical BOOLEAN NOT NULL DEFAULT FALSE,
-                precedence_rank INTEGER NOT NULL DEFAULT 0,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        self.conn.execute("""
-            CREATE INDEX idx_recon_members_group
-            ON condition_reconciliation_members(group_id)
-        """)
-        self.conn.execute("""
-            CREATE INDEX idx_recon_members_patient_condition
-            ON condition_reconciliation_members(patient_id, condition_id)
-        """)
-
+        
         logger.info("DuckDB schema created successfully")
 
     # -------------------------------------------------------------------------
@@ -374,364 +313,6 @@ class ConditionStore:
                     INSERT INTO condition_lineage (patient_id, parent_condition_id, child_condition_id)
                     VALUES (?, ?, ?)
                 """, [patient_id, parent_id, cond_id])
-
-    def _rebuild_code_index(self, patient_id: str) -> None:
-        """Delete and recreate condition_code_index rows for a patient."""
-        self.conn.execute("DELETE FROM condition_code_index WHERE patient_id = ?", [patient_id])
-        rows = self.conn.execute(
-            "SELECT condition_id, primary_code_system, primary_code, alternative_codes "
-            "FROM extracted_conditions_staging WHERE patient_id = ?",
-            [patient_id],
-        ).fetchall()
-        for cond_id, primary_system, primary_code, alt_codes_json in rows:
-            # Insert primary code
-            if primary_system and primary_code:
-                self.conn.execute("""
-                    INSERT INTO condition_code_index
-                        (patient_id, condition_id, code_system, code_value, is_primary)
-                    VALUES (?, ?, ?, ?, TRUE)
-                """, [patient_id, cond_id, primary_system, primary_code])
-            # Insert alternative codes
-            try:
-                alt_codes = json.loads(alt_codes_json) if alt_codes_json else []
-            except (json.JSONDecodeError, TypeError):
-                alt_codes = []
-            for alt in alt_codes:
-                alt_system = alt.get("system") if isinstance(alt, dict) else None
-                alt_code = alt.get("code") if isinstance(alt, dict) else None
-                if alt_system and alt_code:
-                    self.conn.execute("""
-                        INSERT INTO condition_code_index
-                            (patient_id, condition_id, code_system, code_value, is_primary)
-                        VALUES (?, ?, ?, ?, FALSE)
-                    """, [patient_id, cond_id, alt_system, alt_code])
-
-    # Clinical status precedence ranks for canonicalization
-    _CLINICAL_STATUS_RANK: Dict[str, int] = {
-        "Active": 4,
-        "In remission": 3,
-        "Inactive": 2,
-        "Resolved": 1,
-    }
-
-    @staticmethod
-    def _lineage_depth(cid: str, member_set: set, parents_of: Dict[str, set]) -> int:
-        """
-        Return how many ancestor hops (within member_set) exist above cid.
-
-        A condition with no ancestors in the group has depth 0; a direct child has
-        depth 1; a grandchild has depth 2; etc.  Higher depth = preferred canonical.
-        """
-        visited: set = {cid}
-        current_level: set = {cid}
-        depth = 0
-        while True:
-            next_level: set = set()
-            for node in current_level:
-                for anc in parents_of.get(node, set()):
-                    if anc in member_set and anc not in visited:
-                        next_level.add(anc)
-                        visited.add(anc)
-            if not next_level:
-                break
-            depth += 1
-            current_level = next_level
-        return depth
-
-    def reconcile_conditions(self, patient_id: str, mode: str = "on") -> Dict[str, Any]:
-        """
-        Compute reconciliation groups for a patient and persist them in the
-        condition_reconciliation_groups / condition_reconciliation_members tables.
-
-        Canonical selection precedence within each overlap group:
-          1. Lineage depth: deepest descendant wins (child over parent).
-          2. Clinical status rank: Active > In remission > Inactive > Resolved > other.
-          3. Extraction timestamp: most recent wins.
-          4. Stable tiebreak: alphabetically first condition_id.
-
-        Only conditions present in ``current_conditions`` (i.e. not masked by a
-        correction event) are considered as candidates.
-
-        Returns a dict with reconciliation statistics.
-        """
-        if mode not in {"on", "shadow", "off"}:
-            return {"status": "error", "patient_id": patient_id, "error": f"Unknown reconciliation mode: {mode!r}. Use 'on', 'shadow', or 'off'."}
-
-        with self._db_lock:
-            # ---- mode="off": clear all reconciliation state and return --------
-            if mode == "off":
-                self.conn.execute(
-                    "DELETE FROM condition_reconciliation_groups WHERE patient_id = ?", [patient_id]
-                )
-                self.conn.execute(
-                    "DELETE FROM condition_reconciliation_members WHERE patient_id = ?", [patient_id]
-                )
-                self.conn.execute(
-                    "DELETE FROM condition_code_index WHERE patient_id = ?", [patient_id]
-                )
-                logger.info(
-                    "reconciliation_disabled",
-                    extra={"patient_id": patient_id, "mode": "off"},
-                )
-                return {
-                    "status": "off",
-                    "patient_id": patient_id,
-                    "groups_computed": 0,
-                    "groups_merged": 0,
-                    "conditions_deduped": 0,
-                    "ambiguous_groups": 0,
-                    "lineage_overrides": 0,
-                }
-
-            try:
-                self._rebuild_code_index(patient_id)
-
-                # --- Step 1: collect current (unmasked) conditions -------------------
-                cand_rows = self.conn.execute(
-                    "SELECT condition_id, clinical_status, extracted_at "
-                    "FROM current_conditions WHERE patient_id = ?",
-                    [patient_id],
-                ).fetchall()
-
-                if not cand_rows:
-                    # Clear any stale reconciliation rows and return empty stats
-                    self.conn.execute(
-                        "DELETE FROM condition_reconciliation_members WHERE patient_id = ?", [patient_id]
-                    )
-                    self.conn.execute(
-                        "DELETE FROM condition_reconciliation_groups WHERE patient_id = ?", [patient_id]
-                    )
-                    return {
-                        "status": mode if mode == "shadow" else "success",
-                        "patient_id": patient_id,
-                        "groups_computed": 0,
-                        "groups_merged": 0,
-                        "conditions_deduped": 0,
-                        "ambiguous_groups": 0,
-                        "lineage_overrides": 0,
-                    }
-
-                cand_ids = [row[0] for row in cand_rows]
-                cand_status: Dict[str, str] = {row[0]: (row[1] or "") for row in cand_rows}
-                cand_ts: Dict[str, Any] = {row[0]: row[2] for row in cand_rows}
-                cand_set: set = set(cand_ids)
-
-                # --- Step 2: find code-sharing pairs (both ends must be candidates) --
-                all_pairs = self.conn.execute("""
-                SELECT DISTINCT a.condition_id, b.condition_id
-                FROM condition_code_index a
-                JOIN condition_code_index b
-                    ON  a.patient_id   = b.patient_id
-                    AND a.code_system  = b.code_system
-                    AND a.code_value   = b.code_value
-                    AND a.condition_id < b.condition_id
-                WHERE a.patient_id = ?
-                """, [patient_id]).fetchall()
-                pairs = [(a, b) for a, b in all_pairs if a in cand_set and b in cand_set]
-
-                # --- Step 3: union-find to build overlap groups -----------------------
-                uf_parent: Dict[str, str] = {cid: cid for cid in cand_ids}
-
-                def find(x: str) -> str:
-                    while uf_parent[x] != x:
-                        uf_parent[x] = uf_parent[uf_parent[x]]
-                        x = uf_parent[x]
-                    return x
-
-                def union(x: str, y: str) -> None:
-                    rx, ry = find(x), find(y)
-                    if rx != ry:
-                        if rx < ry:
-                            uf_parent[ry] = rx
-                        else:
-                            uf_parent[rx] = ry
-
-                for cid_a, cid_b in pairs:
-                    if cid_a in uf_parent and cid_b in uf_parent:
-                        union(cid_a, cid_b)
-
-                groups: Dict[str, list] = {}
-                for cid in cand_ids:
-                    root = find(cid)
-                    groups.setdefault(root, []).append(cid)
-
-                # --- Step 4: fetch lineage restricted to current candidates ----------
-                lineage_rows = self.conn.execute(
-                    "SELECT parent_condition_id, child_condition_id "
-                    "FROM condition_lineage WHERE patient_id = ?",
-                    [patient_id],
-                ).fetchall()
-                parents_of: Dict[str, set] = {}
-                for p_id, c_id in lineage_rows:
-                    if p_id in cand_set and c_id in cand_set:
-                        parents_of.setdefault(c_id, set()).add(p_id)
-
-                # --- Step 5: clear old reconciliation rows for patient ----------------
-                self.conn.execute(
-                    "DELETE FROM condition_reconciliation_members WHERE patient_id = ?", [patient_id]
-                )
-                self.conn.execute(
-                    "DELETE FROM condition_reconciliation_groups WHERE patient_id = ?", [patient_id]
-                )
-
-                # --- Step 6: insert groups + members ----------------------------------
-                groups_computed = 0
-                groups_merged = 0
-                conditions_deduped = 0
-                ambiguous_groups = 0
-                lineage_overrides = 0
-
-                for root, members in groups.items():
-                    members_sorted = sorted(members)
-                    member_set = set(members)
-                    is_ambiguous = False
-                    decision_basis: str
-                    canonical: str
-
-                    if len(members) == 1:
-                        canonical = members[0]
-                        decision_basis = "no_overlap"
-                    else:
-                        # 1. Lineage depth ranking -----------------------------------
-                        depths = {
-                            cid: self._lineage_depth(cid, member_set, parents_of)
-                            for cid in members
-                        }
-                        max_depth = max(depths.values())
-
-                        if max_depth > 0:
-                            deepest = sorted(
-                                cid for cid, d in depths.items() if d == max_depth
-                            )
-                            canonical = deepest[0]
-                            decision_basis = "lineage"
-                            lineage_overrides += 1
-                        else:
-                            # 2. Clinical status rank ---------------------------------
-                            ranks = {
-                                cid: self._CLINICAL_STATUS_RANK.get(cand_status.get(cid, ""), 0)
-                                for cid in members
-                            }
-                            max_rank = max(ranks.values())
-                            best_by_rank = sorted(
-                                cid for cid, r in ranks.items() if r == max_rank
-                            )
-
-                            if len(best_by_rank) < len(members):
-                                canonical = best_by_rank[0]
-                                decision_basis = "status_rank"
-                            else:
-                                # 3. Extraction timestamp ----------------------------
-                                ts_values = [
-                                    cand_ts[cid]
-                                    for cid in members
-                                    if cand_ts.get(cid) is not None
-                                ]
-                                if ts_values:
-                                    max_ts = max(ts_values)
-                                    best_by_ts = sorted(
-                                        cid for cid in members
-                                        if cand_ts.get(cid) is not None
-                                        and abs((max_ts - cand_ts[cid]).total_seconds()) < 1.0
-                                    )
-                                else:
-                                    best_by_ts = members_sorted
-
-                                if len(best_by_ts) < len(members):
-                                    canonical = best_by_ts[0]
-                                    decision_basis = "timestamp"
-                                else:
-                                    # 4. Stable alphabetical tiebreak (all tied) -----
-                                    canonical = members_sorted[0]
-                                    is_ambiguous = True
-                                    decision_basis = "code_overlap_no_lineage"
-                                    ambiguous_groups += 1
-
-                        groups_merged += 1
-                        conditions_deduped += len(members) - 1
-
-                    group_id = str(uuid.uuid4())
-                    self.conn.execute("""
-                        INSERT INTO condition_reconciliation_groups
-                            (group_id, patient_id, canonical_condition_id, is_ambiguous,
-                             decision_basis, member_count)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, [group_id, patient_id, canonical, is_ambiguous, decision_basis, len(members)])
-
-                    for rank, cid in enumerate(members_sorted):
-                        # In shadow mode, never mark any condition as canonical
-                        is_canonical_val = (cid == canonical) if mode == "on" else False
-                        self.conn.execute("""
-                            INSERT INTO condition_reconciliation_members
-                                (group_id, patient_id, condition_id, is_canonical, precedence_rank)
-                            VALUES (?, ?, ?, ?, ?)
-                        """, [group_id, patient_id, cid, is_canonical_val, rank])
-
-                    groups_computed += 1
-
-                logger.info(
-                    "reconcile_conditions completed",
-                    extra={
-                        "patient_id": patient_id,
-                        "mode": mode,
-                        "groups_computed": groups_computed,
-                        "groups_merged": groups_merged,
-                        "ambiguous_groups": ambiguous_groups,
-                        "lineage_overrides": lineage_overrides,
-                    },
-                )
-
-                return {
-                    "status": "shadow" if mode == "shadow" else "success",
-                    "patient_id": patient_id,
-                    "groups_computed": groups_computed,
-                    "groups_merged": groups_merged,
-                    "conditions_deduped": conditions_deduped,
-                    "ambiguous_groups": ambiguous_groups,
-                    "lineage_overrides": lineage_overrides,
-                }
-
-            except Exception as exc:
-                logger.error(
-                    "reconciliation_failed_reverting_to_unreconciled",
-                    extra={"patient_id": patient_id, "error": str(exc)},
-                )
-                # Clean up ALL partial state so query always falls back to unreconciled
-                self.conn.execute(
-                    "DELETE FROM condition_reconciliation_groups WHERE patient_id = ?", [patient_id]
-                )
-                self.conn.execute(
-                    "DELETE FROM condition_reconciliation_members WHERE patient_id = ?", [patient_id]
-                )
-                self.conn.execute(
-                    "DELETE FROM condition_code_index WHERE patient_id = ?", [patient_id]
-                )
-                return {"status": "error", "patient_id": patient_id, "error": str(exc)}
-
-    def get_reconciliation_mode(self, patient_id: str) -> str:
-        """
-        Return the current reconciliation mode for a patient.
-
-        Returns:
-            ``"off"``    — no reconciliation groups exist.
-            ``"shadow"`` — groups exist but no member is marked canonical.
-            ``"on"``     — at least one member is marked canonical.
-        """
-        with self._db_lock:
-            group_count = self.conn.execute(
-                "SELECT COUNT(*) FROM condition_reconciliation_groups WHERE patient_id = ?",
-                [patient_id],
-            ).fetchone()[0]
-            if group_count == 0:
-                return "off"
-            canonical_count = self.conn.execute(
-                "SELECT COUNT(*) FROM condition_reconciliation_members "
-                "WHERE patient_id = ? AND is_canonical = TRUE",
-                [patient_id],
-            ).fetchone()[0]
-            if canonical_count == 0:
-                return "shadow"
-            return "on"
 
     def ingest_batch(
         self,
@@ -830,76 +411,33 @@ class ConditionStore:
     ) -> List[Dict]:
         """
         Query the live representation of current conditions.
-
-        When reconciliation groups exist for the patient (i.e. ``reconcile_conditions``
-        has been called), only the canonical condition per group is returned.  This
-        provides a deduplicated, lineage-aware view of current patient state.
-
-        When no reconciliation groups exist yet, all unmasked conditions are returned
-        (backward-compatible behaviour for callers that never call reconcile).
-
+        
         Args:
             patient_id: Patient identifier
             filters: Optional dict with keys like 'status', 'code_system', 'code'
-
+            
         Returns:
-            List of condition dictionaries (same schema as before)
+            List of condition dictionaries
         """
+        query = "SELECT * FROM current_conditions WHERE patient_id = ?"
+        params = [patient_id]
+
+        if filters:
+            if "status" in filters:
+                query += " AND clinical_status = ?"
+                params.append(filters["status"])
+
+            if "code_system" in filters:
+                query += " AND primary_code_system = ?"
+                params.append(filters["code_system"])
+
+            if "code" in filters:
+                query += " AND primary_code = ?"
+                params.append(filters["code"])
+
+        query += " ORDER BY extracted_at DESC"
+
         with self._db_lock:
-            # Check whether reconciliation groups exist for this patient
-            group_count = self.conn.execute(
-                "SELECT COUNT(*) FROM condition_reconciliation_groups WHERE patient_id = ?",
-                [patient_id],
-            ).fetchone()[0]
-
-            params = [patient_id]
-
-            # In shadow mode, groups exist but no member is canonical — fall back to unreconciled.
-            canonical_count = 0
-            if group_count > 0:
-                canonical_count = self.conn.execute(
-                    "SELECT COUNT(*) FROM condition_reconciliation_members "
-                    "WHERE patient_id = ? AND is_canonical = TRUE",
-                    [patient_id],
-                ).fetchone()[0]
-
-            if group_count == 0 or canonical_count == 0:
-                # No reconciliation run yet (off) or shadow mode — return all unmasked conditions
-                query = "SELECT * FROM current_conditions WHERE patient_id = ?"
-                if filters:
-                    if "status" in filters:
-                        query += " AND clinical_status = ?"
-                        params.append(filters["status"])
-                    if "code_system" in filters:
-                        query += " AND primary_code_system = ?"
-                        params.append(filters["code_system"])
-                    if "code" in filters:
-                        query += " AND primary_code = ?"
-                        params.append(filters["code"])
-                query += " ORDER BY extracted_at DESC"
-            else:
-                # Return only the canonical condition per reconciliation group,
-                # while still respecting the correction mask (current_conditions view).
-                query = """
-                    SELECT cc.* FROM current_conditions cc
-                    INNER JOIN condition_reconciliation_members crm
-                        ON cc.patient_id = crm.patient_id
-                        AND cc.condition_id = crm.condition_id
-                    WHERE cc.patient_id = ?
-                      AND crm.is_canonical = TRUE
-                """
-                if filters:
-                    if "status" in filters:
-                        query += " AND cc.clinical_status = ?"
-                        params.append(filters["status"])
-                    if "code_system" in filters:
-                        query += " AND cc.primary_code_system = ?"
-                        params.append(filters["code_system"])
-                    if "code" in filters:
-                        query += " AND cc.primary_code = ?"
-                        params.append(filters["code"])
-                query += " ORDER BY cc.extracted_at DESC"
-
             result = self.conn.execute(query, params).fetchall()
             return self._rows_to_dicts(result, "current_conditions")
 
@@ -1015,21 +553,6 @@ class ConditionStore:
                     },
                 )
 
-                # Invalidate stale reconciliation groups: a corrected condition may have been
-                # the stored canonical. Clear groups so query_current_conditions falls back to
-                # the unreconciled path (which already respects the correction mask). The caller
-                # should re-run reconcile_conditions() to rebuild groups after corrections.
-                if affected_count > 0:
-                    self.conn.execute(
-                        "DELETE FROM condition_reconciliation_members WHERE patient_id = ?", [patient_id]
-                    )
-                    self.conn.execute(
-                        "DELETE FROM condition_reconciliation_groups WHERE patient_id = ?", [patient_id]
-                    )
-                    self.conn.execute(
-                        "DELETE FROM condition_code_index WHERE patient_id = ?", [patient_id]
-                    )
-
                 return {
                     "status": "success",
                     "patient_id": patient_id,
@@ -1089,11 +612,6 @@ class ConditionStore:
         Returns:
             Dictionary with counts and breakdowns
         """
-        with self._db_lock:
-            return self._get_statistics_locked(patient_id)
-
-    def _get_statistics_locked(self, patient_id: str) -> Dict[str, Any]:
-        """Thread-unsafe inner implementation — caller must hold self._db_lock."""
         # Total conditions (before masking)
         total_raw = self.conn.execute(
             "SELECT COUNT(*) FROM extracted_conditions_staging WHERE patient_id = ?",
@@ -1137,31 +655,7 @@ class ConditionStore:
             SELECT COUNT(*) FROM current_conditions
             WHERE patient_id = ? AND validation_flags != '[]'
         """, [patient_id]).fetchall()[0][0]
-
-        # Reconciliation statistics (populated after reconcile_conditions())
-        recon_groups_total = self.conn.execute(
-            "SELECT COUNT(*) FROM condition_reconciliation_groups WHERE patient_id = ?",
-            [patient_id],
-        ).fetchone()[0]
-        recon_groups_merged = self.conn.execute(
-            "SELECT COUNT(*) FROM condition_reconciliation_groups WHERE patient_id = ? AND member_count > 1",
-            [patient_id],
-        ).fetchone()[0]
-        recon_conditions_deduped = self.conn.execute(
-            "SELECT COALESCE(SUM(member_count - 1), 0) FROM condition_reconciliation_groups "
-            "WHERE patient_id = ? AND member_count > 1",
-            [patient_id],
-        ).fetchone()[0]
-        recon_ambiguous = self.conn.execute(
-            "SELECT COUNT(*) FROM condition_reconciliation_groups WHERE patient_id = ? AND is_ambiguous = TRUE",
-            [patient_id],
-        ).fetchone()[0]
-        recon_lineage_overrides = self.conn.execute(
-            "SELECT COUNT(*) FROM condition_reconciliation_groups "
-            "WHERE patient_id = ? AND decision_basis IN ('lineage', 'lineage_tiebreak')",
-            [patient_id],
-        ).fetchone()[0]
-
+        
         return {
             "patient_id": patient_id,
             "total_conditions_raw": total_raw,
@@ -1170,11 +664,6 @@ class ConditionStore:
             "by_status": status_dict,
             "by_coding_system": system_dict,
             "conditions_with_flags": flag_counts,
-            "reconciliation_groups_total": int(recon_groups_total),
-            "reconciliation_groups_merged": int(recon_groups_merged),
-            "reconciliation_conditions_deduped": int(recon_conditions_deduped),
-            "reconciliation_ambiguous_groups": int(recon_ambiguous),
-            "reconciliation_lineage_overrides": int(recon_lineage_overrides),
         }
 
     def _rows_to_dicts(self, rows: List[tuple], view_name: str) -> List[Dict]:
@@ -1190,9 +679,10 @@ class ConditionStore:
 
     def ingest_raw_batch(
         self,
-        patient_id: str,
-        raw_conditions: List[dict],
         batch_id: Optional[uuid.UUID] = None,
+        patient_id: str = None,
+        extracted_conditions: List[ExtractedCondition] = None,
+        raw_events: List[dict] = None,
     ) -> Dict[str, Any]:
         """
         Event-first ingestion: persist every incoming payload (valid or malformed)
