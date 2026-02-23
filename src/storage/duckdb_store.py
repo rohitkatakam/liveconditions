@@ -679,8 +679,9 @@ class ConditionStore:
 
     def ingest_raw_batch(
         self,
-        batch_id: Optional[uuid.UUID] = None,
         patient_id: str = None,
+        raw_conditions: List[dict] = None,
+        batch_id: Optional[uuid.UUID] = None,
         extracted_conditions: List[ExtractedCondition] = None,
         raw_events: List[dict] = None,
     ) -> Dict[str, Any]:
@@ -695,10 +696,17 @@ class ConditionStore:
             patient_id: Patient identifier
             raw_conditions: Raw FHIR Condition dicts; may include malformed records
             batch_id: UUID for this batch (auto-generated if not provided)
+            raw_events: Backward-compat alias for raw_conditions
 
         Returns:
             Dictionary with ingestion statistics including failed count
         """
+        # Support legacy raw_events kwarg alias
+        if raw_conditions is None and raw_events is not None:
+            raw_conditions = raw_events
+        if raw_conditions is None:
+            raw_conditions = []
+
         if batch_id is None:
             batch_id = uuid.uuid4()
 

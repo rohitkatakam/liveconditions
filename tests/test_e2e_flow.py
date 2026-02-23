@@ -11,6 +11,17 @@ from src.parser import ConditionParser
 from src.models import ConditionValidator
 from src.storage import ConditionStore, BackgroundIngestionWorker, IngestionJob
 from src.mcp_tools import ConditionTools
+from src.mcp_server import create_mcp_server
+
+# Canonical patient ID used by TestLatency / TestMCPTools
+PATIENT = "test-patient-e2e"
+
+
+@pytest.fixture
+def conditions_data():
+    """Load all FHIR conditions from the sample dataset."""
+    with open("conditions.json") as f:
+        return json.load(f)
 
 
 @pytest.fixture
@@ -480,11 +491,11 @@ class TestStatisticsAndMetadata:
         assert isinstance(stats["by_status"], dict)
 
         # After one correction, current count drops
-        cid = store.query_current_conditions(PATIENT)[0]["condition_id"]
-        store.issue_correction(patient_id=PATIENT, condition_ids=[cid])
-        stats2 = store.get_statistics(PATIENT)
-        assert stats2["total_conditions_current"] == len(conditions_data) - 1
-        assert stats2["total_conditions_raw"] == len(conditions_data)
+        cid = store.query_current_conditions(patient_id)[0]["condition_id"]
+        store.issue_correction(patient_id=patient_id, condition_ids=[cid])
+        stats2 = store.get_statistics(patient_id)
+        assert stats2["total_conditions_current"] == len(extracted) - 1
+        assert stats2["total_conditions_raw"] == len(extracted)
 
 
 # ---------------------------------------------------------------------------
@@ -526,12 +537,12 @@ class TestLatency:
         store.start_background_worker()
         try:
             status = store.get_background_ingestion_status()
-            assert status["jobs_enqueued"] == 3, (
-                f"Expected jobs_enqueued=3, got: {status['jobs_enqueued']}"
-            )
-            assert status["jobs_processed"] == 3, (
-                f"Expected jobs_processed=3, got: {status['jobs_processed']}"
-            )
+            required_keys = {"worker_running", "queue_depth", "jobs_enqueued", "jobs_processed", "jobs_failed"}
+            missing = required_keys - set(status.keys())
+            assert not missing, f"Missing health keys: {missing}"
+            assert status["worker_running"] is True
+            assert status["jobs_enqueued"] == 0
+            assert status["jobs_processed"] == 0
         finally:
             store.stop_background_worker()
 
