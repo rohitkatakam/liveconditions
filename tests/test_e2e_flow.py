@@ -660,3 +660,135 @@ class TestEventFirstIngestion:
         assert stats["parsed"] == len(all_conditions)
         assert result["conditions_failed"] == 3
         assert result["conditions_ingested"] == len(all_conditions)
+
+
+class TestMCPServerRegistration:
+    """Tests for FastMCP server adapter wiring."""
+
+    @pytest.fixture
+    def mcp_app_and_store(self):
+        """Create a fresh MCP server with a new store."""
+        from src.mcp_server import create_mcp_server
+
+        app, store = create_mcp_server()
+        yield app, store
+        store.close()
+
+    @pytest.fixture
+    def populated_mcp(self, sample_conditions):
+        """Create a server with day1 conditions already ingested."""
+        from src.mcp_server import create_mcp_server
+
+        app, store = create_mcp_server()
+        patient_id = "mcp-test-patient-001"
+        store.ingest_raw_batch(
+            patient_id=patient_id,
+            raw_conditions=sample_conditions["day1"],
+        )
+        yield app, store, patient_id
+        store.close()
+
+    def test_mcp_server_builds_and_registers_tools(self, mcp_app_and_store):
+        """create_mcp_server returns an app with both tools registered."""
+        app, _store = mcp_app_and_store
+        registered_names = set(app._tool_manager._tools.keys())
+        assert "query_conditions" in registered_names
+        assert "issue_correction" in registered_names
+
+    @pytest.mark.asyncio
+    async def test_mcp_query_conditions_returns_expected_payload(self, populated_mcp):
+        """Calling query_conditions via MCP app returns the expected contract."""
+        app, _store, patient_id = populated_mcp
+
+        result = await app.call_tool("query_conditions", {"patient_id": patient_id})
+        assert result, "Should return non-empty result"
+
+        import json as _json
+
+        payload = _json.loads(result[0].text)
+        assert payload["status"] == "success"
+        assert "conditions" in payload
+        assert "total_count" in payload
+        assert "metadata" in payload
+        assert payload["total_count"] > 0
+
+    @pytest.mark.asyncio
+    async def test_mcp_query_conditions_respects_filters(self, populated_mcp):
+        """query_conditions with status filter returns only matching conditions."""
+        app, _store, patient_id = populated_mcp
+
+        result = await app.call_tool(
+            "query_conditions", {"patient_id": patient_id, "status": "Active"}
+        )
+
+        import json as _json
+
+        payload = _json.loads(result[0].text)
+        assert payload["status"] == "success"
+        for condition in payload["conditions"]:
+            assert condition.get("clinical_status", "").lower() == "active"
+
+    @pytest.mark.asyncio
+    async def test_mcp_issue_correction_masks_condition(self, populated_mcp):
+        """issue_correction removes the masked condition from subsequent queries."""
+        app, _store, patient_id = populated_mcp
+        import json as _json
+
+        # Get current conditions
+        result = await app.call_tool("query_conditions", {"patient_id": patient_id})
+        payload = _json.loads(result[0].text)
+        assert payload["total_count"] > 0
+
+        # Pick the first condition to mask
+        target_id = payload["conditions"][0]["condition_id"]
+
+        # Issue correction
+        corr_result = await app.call_tool(
+            "issue_correction",
+            {"patient_id": patient_id, "condition_ids": [target_id], "reason": "test correction"},
+        )
+        corr_payload = _json.loads(corr_result[0].text)
+        assert corr_payload["status"] == "success"
+        assert corr_payload["conditions_masked"] >= 1
+
+        # Re-query: masked condition should be gone
+        after_result = await app.call_tool("query_conditions", {"patient_id": patient_id})
+        after_payload = _json.loads(after_result[0].text)
+        remaining_ids = {c["condition_id"] for c in after_payload["conditions"]}
+        assert target_id not in remaining_ids
+
+    @pytest.mark.asyncio
+    async def test_mcp_issue_correction_preserves_audit_trail(self, populated_mcp):
+        """After correction, ingestion events table count is unchanged."""
+        app, store, patient_id = populated_mcp
+        import json as _json
+
+        # Capture ingestion event count before correction
+        count_before = store.conn.execute(
+            "SELECT COUNT(*) FROM condition_ingestion_events WHERE patient_id = ?",
+            [patient_id],
+        ).fetchone()[0]
+
+        # Issue a correction
+        result = await app.call_tool("query_conditions", {"patient_id": patient_id})
+        payload = _json.loads(result[0].text)
+        target_id = payload["conditions"][0]["condition_id"]
+
+        await app.call_tool(
+            "issue_correction",
+            {"patient_id": patient_id, "condition_ids": [target_id]},
+        )
+
+        # Ingestion events unchanged
+        count_after = store.conn.execute(
+            "SELECT COUNT(*) FROM condition_ingestion_events WHERE patient_id = ?",
+            [patient_id],
+        ).fetchone()[0]
+        assert count_after == count_before
+
+        # Correction event exists
+        corr_count = store.conn.execute(
+            "SELECT COUNT(*) FROM correction_events WHERE patient_id = ?",
+            [patient_id],
+        ).fetchone()[0]
+        assert corr_count >= 1
