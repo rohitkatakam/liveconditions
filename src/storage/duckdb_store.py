@@ -216,6 +216,98 @@ class ConditionStore:
         
         logger.info("DuckDB schema created successfully")
 
+    # -------------------------------------------------------------------------
+    # Private helpers — shared between ingest_batch and ingest_raw_batch
+    # -------------------------------------------------------------------------
+
+    def _upsert_extracted_condition(
+        self,
+        extracted: "ExtractedCondition",
+        last_event_id: str,
+        patient_id: str,
+    ) -> None:
+        """Insert or update one extracted condition in the staging table."""
+        existing = self.conn.execute(
+            "SELECT extracted_id FROM extracted_conditions_staging WHERE patient_id = ? AND condition_id = ?",
+            [patient_id, extracted.condition_id],
+        ).fetchall()
+
+        if existing:
+            self.conn.execute("""
+                UPDATE extracted_conditions_staging
+                SET
+                    code_text = ?,
+                    primary_code_system = ?,
+                    primary_code = ?,
+                    alternative_codes = ?,
+                    clinical_status = ?,
+                    clinical_status_code = ?,
+                    onset_start = ?,
+                    onset_end = ?,
+                    recorded_by_practitioner = ?,
+                    derived_from_ids = ?,
+                    validation_flags = ?,
+                    last_ingestion_event_id = ?
+                WHERE patient_id = ? AND condition_id = ?
+            """, [
+                extracted.code_text,
+                extracted.primary_code_system,
+                extracted.primary_code,
+                json.dumps(extracted.alternative_codes),
+                extracted.clinical_status,
+                extracted.clinical_status_code,
+                extracted.onset_start,
+                extracted.onset_end,
+                extracted.recorded_by_practitioner,
+                json.dumps(extracted.derived_from_ids),
+                json.dumps(extracted.validation_flags),
+                last_event_id,
+                patient_id,
+                extracted.condition_id,
+            ])
+        else:
+            self.conn.execute("""
+                INSERT INTO extracted_conditions_staging (
+                    patient_id, condition_id, code_text, primary_code_system,
+                    primary_code, alternative_codes, clinical_status,
+                    clinical_status_code, onset_start, onset_end,
+                    recorded_by_practitioner, derived_from_ids,
+                    validation_flags, last_ingestion_event_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, [
+                extracted.patient_id,
+                extracted.condition_id,
+                extracted.code_text,
+                extracted.primary_code_system,
+                extracted.primary_code,
+                json.dumps(extracted.alternative_codes),
+                extracted.clinical_status,
+                extracted.clinical_status_code,
+                extracted.onset_start,
+                extracted.onset_end,
+                extracted.recorded_by_practitioner,
+                json.dumps(extracted.derived_from_ids),
+                json.dumps(extracted.validation_flags),
+                last_event_id,
+            ])
+
+    def _rebuild_lineage(self, patient_id: str) -> None:
+        """Delete and recreate condition_lineage rows for the patient."""
+        self.conn.execute("DELETE FROM condition_lineage WHERE patient_id = ?", [patient_id])
+        for cond_id, derived_json in self.conn.execute(
+            "SELECT condition_id, derived_from_ids FROM extracted_conditions_staging WHERE patient_id = ?",
+            [patient_id],
+        ).fetchall():
+            try:
+                parent_ids = json.loads(derived_json) if derived_json else []
+            except (json.JSONDecodeError, TypeError):
+                parent_ids = []
+            for parent_id in parent_ids:
+                self.conn.execute("""
+                    INSERT INTO condition_lineage (patient_id, parent_condition_id, child_condition_id)
+                    VALUES (?, ?, ?)
+                """, [patient_id, parent_id, cond_id])
+
     def ingest_batch(
         self,
         batch_id: Optional[uuid.UUID] = None,
@@ -224,156 +316,61 @@ class ConditionStore:
         raw_events: List[dict] = None,
     ) -> Dict[str, Any]:
         """
-        Ingest a batch of conditions: append to events, rebuild derived tables.
-        
+        Ingest a batch of pre-parsed conditions: append to events, rebuild derived tables.
+
+        Compatibility path: prefer ``ingest_raw_batch`` for new callers.
+
         Args:
             batch_id: UUID for this ingestion batch (auto-generated if not provided)
             patient_id: Patient identifier
             extracted_conditions: List of ExtractedCondition objects
-            raw_events: List of raw FHIR Condition dicts
-            
+            raw_events: List of raw FHIR Condition dicts (used as raw_payload when provided)
+
         Returns:
-            Dictionary with ingestion statistics
+            Dictionary with ingestion statistics: status, batch_id, patient_id,
+            total, conditions_ingested, conditions_failed, conditions_flagged.
         """
         if batch_id is None:
             batch_id = uuid.uuid4()
-        
+
         if extracted_conditions is None or not extracted_conditions:
             logger.warning(f"No conditions to ingest for patient {patient_id}")
             return {"status": "no_data", "batch_id": str(batch_id)}
-        
+
         try:
             # 1. Append to condition_ingestion_events
-            for extracted, raw in zip(extracted_conditions, raw_events or [None] * len(extracted_conditions)):
+            for extracted, raw in zip(
+                extracted_conditions, raw_events or [None] * len(extracted_conditions)
+            ):
                 event_id = uuid.uuid4()
-                
-                # Get validation flags
                 flags = extracted.validation_flags if extracted.validation_flags else []
-                flags_json = json.dumps(flags)
-                
-                # Get raw payload
-                if raw is not None:
-                    raw_payload_json = json.dumps(raw)
-                else:
-                    # Reconstruct from extracted if raw not provided
-                    raw_payload_json = json.dumps({"id": extracted.condition_id})
-                
+                raw_payload_json = (
+                    json.dumps(raw) if raw is not None
+                    else json.dumps({"id": extracted.condition_id})
+                )
                 self.conn.execute("""
                     INSERT INTO condition_ingestion_events (
-                        event_id, ingestion_batch_id, patient_id, condition_id, 
-                        raw_payload, validation_flags
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                        event_id, ingestion_batch_id, patient_id, condition_id,
+                        raw_payload, validation_flags, ingestion_outcome
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'parsed')
                 """, [
-                    str(event_id),
-                    str(batch_id),
-                    patient_id,
-                    extracted.condition_id,
-                    raw_payload_json,
-                    flags_json,
+                    str(event_id), str(batch_id), patient_id,
+                    extracted.condition_id, raw_payload_json, json.dumps(flags),
                 ])
-            
-            # 2. Rebuild extracted_conditions_staging (merge with existing, don't delete)
-            # For each condition, keep the most recent version
+
+            # 2. Upsert into extracted_conditions_staging
             for extracted in extracted_conditions:
-                # Get the most recent ingestion event for this condition
                 event_result = self.conn.execute("""
                     SELECT event_id FROM condition_ingestion_events
                     WHERE patient_id = ? AND condition_id = ?
                     ORDER BY timestamp DESC LIMIT 1
                 """, [patient_id, extracted.condition_id]).fetchall()
-                
                 last_event_id = event_result[0][0] if event_result else str(uuid.uuid4())
-                
-                # Check if this condition already exists in staging
-                existing = self.conn.execute("""
-                    SELECT extracted_id FROM extracted_conditions_staging
-                    WHERE patient_id = ? AND condition_id = ?
-                """, [patient_id, extracted.condition_id]).fetchall()
-                
-                if existing:
-                    # Update existing
-                    self.conn.execute("""
-                        UPDATE extracted_conditions_staging
-                        SET 
-                            code_text = ?,
-                            primary_code_system = ?,
-                            primary_code = ?,
-                            alternative_codes = ?,
-                            clinical_status = ?,
-                            clinical_status_code = ?,
-                            onset_start = ?,
-                            onset_end = ?,
-                            recorded_by_practitioner = ?,
-                            derived_from_ids = ?,
-                            validation_flags = ?,
-                            last_ingestion_event_id = ?
-                        WHERE patient_id = ? AND condition_id = ?
-                    """, [
-                        extracted.code_text,
-                        extracted.primary_code_system,
-                        extracted.primary_code,
-                        json.dumps(extracted.alternative_codes),
-                        extracted.clinical_status,
-                        extracted.clinical_status_code,
-                        extracted.onset_start,
-                        extracted.onset_end,
-                        extracted.recorded_by_practitioner,
-                        json.dumps(extracted.derived_from_ids),
-                        json.dumps(extracted.validation_flags),
-                        last_event_id,
-                        patient_id,
-                        extracted.condition_id,
-                    ])
-                else:
-                    # Insert new
-                    self.conn.execute("""
-                        INSERT INTO extracted_conditions_staging (
-                            patient_id, condition_id, code_text, primary_code_system,
-                            primary_code, alternative_codes, clinical_status,
-                            clinical_status_code, onset_start, onset_end,
-                            recorded_by_practitioner, derived_from_ids,
-                            validation_flags, last_ingestion_event_id
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, [
-                        extracted.patient_id,
-                        extracted.condition_id,
-                        extracted.code_text,
-                        extracted.primary_code_system,
-                        extracted.primary_code,
-                        json.dumps(extracted.alternative_codes),
-                        extracted.clinical_status,
-                        extracted.clinical_status_code,
-                        extracted.onset_start,
-                        extracted.onset_end,
-                        extracted.recorded_by_practitioner,
-                        json.dumps(extracted.derived_from_ids),
-                        json.dumps(extracted.validation_flags),
-                        last_event_id,
-                    ])
-            
-            # 3. Rebuild condition_lineage (delete and recreate for patient)
-            self.conn.execute("DELETE FROM condition_lineage WHERE patient_id = ?", [patient_id])
-            
-            # Get all conditions for this patient and rebuild lineage
-            all_conditions = self.conn.execute("""
-                SELECT condition_id, derived_from_ids FROM extracted_conditions_staging
-                WHERE patient_id = ?
-            """, [patient_id]).fetchall()
-            
-            for condition_id, derived_from_ids_json in all_conditions:
-                try:
-                    derived_from_ids = json.loads(derived_from_ids_json) if derived_from_ids_json else []
-                except (json.JSONDecodeError, TypeError):
-                    derived_from_ids = []
-                
-                if derived_from_ids:
-                    for parent_id in derived_from_ids:
-                        self.conn.execute("""
-                            INSERT INTO condition_lineage (
-                                patient_id, parent_condition_id, child_condition_id
-                            ) VALUES (?, ?, ?)
-                        """, [patient_id, parent_id, condition_id])
-            
+                self._upsert_extracted_condition(extracted, last_event_id, patient_id)
+
+            # 3. Rebuild lineage
+            self._rebuild_lineage(patient_id)
+
             logger.info(
                 f"Ingested batch {batch_id}: {len(extracted_conditions)} conditions for patient {patient_id}",
                 extra={
@@ -382,14 +379,18 @@ class ConditionStore:
                     "condition_count": len(extracted_conditions),
                 },
             )
-            
+
+            flagged = sum(1 for c in extracted_conditions if c.validation_flags)
             return {
                 "status": "success",
                 "batch_id": str(batch_id),
                 "patient_id": patient_id,
+                "total": len(extracted_conditions),
                 "conditions_ingested": len(extracted_conditions),
+                "conditions_failed": 0,
+                "conditions_flagged": flagged,
             }
-        
+
         except Exception as e:
             logger.error(
                 f"Failed to ingest batch {batch_id}: {str(e)}",
@@ -679,13 +680,46 @@ class ConditionStore:
         valid_extracted: List[ExtractedCondition] = []
 
         for raw in raw_conditions:
-            result = ConditionValidator.validate(raw)
             event_id = uuid.uuid4()
-            raw_payload_json = json.dumps(raw)
+            try:
+                result = ConditionValidator.validate(raw)
+                raw_payload_json = json.dumps(raw)
+            except Exception as exc:
+                # Completely un-parseable payload (e.g. non-dict): persist as failed event
+                failed += 1
+                condition_id = f"unknown-{event_id}"
+                error_detail_json = json.dumps({
+                    "error_type": "unparseable_payload",
+                    "error_message": str(exc),
+                    "source_stage": "ingest_raw_batch.pre_validate",
+                })
+                try:
+                    raw_payload_json = json.dumps(raw)
+                except Exception:
+                    raw_payload_json = json.dumps({"raw": str(raw)})
+                self.conn.execute("""
+                    INSERT INTO condition_ingestion_events (
+                        event_id, ingestion_batch_id, patient_id, condition_id,
+                        raw_payload, validation_flags, ingestion_outcome, error_detail
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, [
+                    str(event_id), str(batch_id), patient_id, condition_id,
+                    raw_payload_json, json.dumps([]),
+                    "failed_validation", error_detail_json,
+                ])
+                logger.warning(
+                    "Unparseable payload persisted as failed_validation event",
+                    extra={
+                        "batch_id": str(batch_id),
+                        "patient_id": patient_id,
+                        "error": str(exc),
+                    },
+                )
+                continue
 
             if not result.is_valid:
                 failed += 1
-                condition_id = raw.get("id", f"unknown-{event_id}")
+                condition_id = raw.get("id", f"unknown-{event_id}") if isinstance(raw, dict) else f"unknown-{event_id}"
                 error_detail_json = json.dumps({
                     "error_type": "validation_failed",
                     "error_message": result.error_message or "Unknown parse error",
@@ -737,60 +771,10 @@ class ConditionStore:
                 ORDER BY timestamp DESC LIMIT 1
             """, [patient_id, extracted.condition_id]).fetchall()
             last_event_id = event_result[0][0] if event_result else str(uuid.uuid4())
-
-            existing = self.conn.execute("""
-                SELECT extracted_id FROM extracted_conditions_staging
-                WHERE patient_id = ? AND condition_id = ?
-            """, [patient_id, extracted.condition_id]).fetchall()
-
-            if existing:
-                self.conn.execute("""
-                    UPDATE extracted_conditions_staging
-                    SET code_text = ?, primary_code_system = ?, primary_code = ?,
-                        alternative_codes = ?, clinical_status = ?, clinical_status_code = ?,
-                        onset_start = ?, onset_end = ?, recorded_by_practitioner = ?,
-                        derived_from_ids = ?, validation_flags = ?, last_ingestion_event_id = ?
-                    WHERE patient_id = ? AND condition_id = ?
-                """, [
-                    extracted.code_text, extracted.primary_code_system, extracted.primary_code,
-                    json.dumps(extracted.alternative_codes), extracted.clinical_status,
-                    extracted.clinical_status_code, extracted.onset_start, extracted.onset_end,
-                    extracted.recorded_by_practitioner, json.dumps(extracted.derived_from_ids),
-                    json.dumps(extracted.validation_flags), last_event_id,
-                    patient_id, extracted.condition_id,
-                ])
-            else:
-                self.conn.execute("""
-                    INSERT INTO extracted_conditions_staging (
-                        patient_id, condition_id, code_text, primary_code_system,
-                        primary_code, alternative_codes, clinical_status, clinical_status_code,
-                        onset_start, onset_end, recorded_by_practitioner, derived_from_ids,
-                        validation_flags, last_ingestion_event_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, [
-                    extracted.patient_id, extracted.condition_id, extracted.code_text,
-                    extracted.primary_code_system, extracted.primary_code,
-                    json.dumps(extracted.alternative_codes), extracted.clinical_status,
-                    extracted.clinical_status_code, extracted.onset_start, extracted.onset_end,
-                    extracted.recorded_by_practitioner, json.dumps(extracted.derived_from_ids),
-                    json.dumps(extracted.validation_flags), last_event_id,
-                ])
+            self._upsert_extracted_condition(extracted, last_event_id, patient_id)
 
         # Rebuild lineage from staging
-        self.conn.execute("DELETE FROM condition_lineage WHERE patient_id = ?", [patient_id])
-        for cond_id, derived_json in self.conn.execute(
-            "SELECT condition_id, derived_from_ids FROM extracted_conditions_staging WHERE patient_id = ?",
-            [patient_id],
-        ).fetchall():
-            try:
-                parent_ids = json.loads(derived_json) if derived_json else []
-            except (json.JSONDecodeError, TypeError):
-                parent_ids = []
-            for parent_id in parent_ids:
-                self.conn.execute("""
-                    INSERT INTO condition_lineage (patient_id, parent_condition_id, child_condition_id)
-                    VALUES (?, ?, ?)
-                """, [patient_id, parent_id, cond_id])
+        self._rebuild_lineage(patient_id)
 
         logger.info(
             "Raw batch ingested",
@@ -827,12 +811,17 @@ class ConditionStore:
             GROUP BY ingestion_outcome
         """, [patient_id]).fetchall()
         by_outcome = {row[0]: row[1] for row in rows}
+        flagged_count = self.conn.execute("""
+            SELECT COUNT(*) FROM condition_ingestion_events
+            WHERE patient_id = ? AND ingestion_outcome = 'parsed' AND validation_flags != '[]'
+        """, [patient_id]).fetchone()[0]
         return {
             "patient_id": patient_id,
             "total_attempted": sum(by_outcome.values()),
             "by_outcome": by_outcome,
             "parsed": by_outcome.get("parsed", 0),
             "failed_validation": by_outcome.get("failed_validation", 0),
+            "conditions_flagged": flagged_count,
         }
 
     def close(self):

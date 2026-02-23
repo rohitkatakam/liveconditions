@@ -792,3 +792,166 @@ class TestMCPServerRegistration:
             [patient_id],
         ).fetchone()[0]
         assert corr_count >= 1
+
+
+class TestCanonicalIngestion:
+    """Locks the canonical ingest_raw_batch contract (write-path hardening)."""
+
+    def test_canonical_ingestion_records_all_attempts_from_raw_batch(
+        self, store, sample_conditions
+    ):
+        """Mixed batch: valid + malformed — all attempts must appear in event stats."""
+        patient_id = "canonical-test-001"
+        day1 = sample_conditions["day1"]
+        malformed = [
+            {"resourceType": "Condition", "id": "bad-1"},
+            {"resourceType": "Condition", "id": "bad-2"},
+        ]
+        mixed = day1 + malformed
+
+        store.ingest_raw_batch(patient_id, raw_conditions=mixed)
+
+        stats = store.get_ingestion_event_stats(patient_id)
+        assert stats["total_attempted"] == len(day1) + 2
+        assert stats["failed_validation"] == 2
+        assert stats["parsed"] == len(day1)
+
+        live = store.query_current_conditions(patient_id)
+        live_ids = {c["condition_id"] for c in live}
+        assert "bad-1" not in live_ids
+        assert "bad-2" not in live_ids
+
+    def test_invalid_payloads_never_enter_live_view_but_remain_auditable(self, store):
+        """Malformed-only batch: zero live rows, but event table has auditable rows."""
+        patient_id = "canonical-test-002"
+        malformed_only = [
+            {"resourceType": "Condition", "id": "bad-only-1"},
+            {"resourceType": "Condition", "id": "bad-only-2"},
+        ]
+
+        store.ingest_raw_batch(patient_id, raw_conditions=malformed_only)
+
+        live = store.query_current_conditions(patient_id)
+        assert len(live) == 0
+
+        failed_rows = store.conn.execute(
+            """SELECT event_id, error_detail FROM condition_ingestion_events
+               WHERE patient_id = ? AND ingestion_outcome = 'failed_validation'""",
+            [patient_id],
+        ).fetchall()
+        assert len(failed_rows) == 2
+
+        for row in failed_rows:
+            error_detail = json.loads(row[1])
+            assert "error_type" in error_detail
+            assert "error_message" in error_detail
+            assert "source_stage" in error_detail
+
+    def test_out_of_order_ingestion_via_raw_path(self, store, sample_conditions):
+        """Day 2 arrives first via ingest_raw_batch, then Day 1 — merged count must be correct."""
+        patient_id = "canonical-test-003"
+        day1 = sample_conditions["day1"]
+        day2 = sample_conditions["day2"]
+
+        # Ingest day2 first
+        store.ingest_raw_batch(patient_id, raw_conditions=day2)
+        count_after_day2 = len(store.query_current_conditions(patient_id))
+
+        # Then ingest day1
+        store.ingest_raw_batch(patient_id, raw_conditions=day1)
+        count_after_day1 = len(store.query_current_conditions(patient_id))
+
+        assert count_after_day1 >= count_after_day2
+        assert count_after_day1 <= len(day1) + len(day2)
+
+    def test_correction_flow_works_after_raw_canonical_ingestion(
+        self, store, sample_conditions
+    ):
+        """After ingest_raw_batch, issue_correction masks TB and leaves ingestion events intact."""
+        patient_id = "canonical-test-004"
+        day1 = sample_conditions["day1"]
+
+        store.ingest_raw_batch(patient_id, raw_conditions=day1)
+
+        conditions = store.query_current_conditions(patient_id)
+        tb_conditions = [c for c in conditions if "tubercul" in c["code_text"].lower()]
+
+        if not tb_conditions:
+            pytest.skip("No TB conditions in day1 sample data")
+
+        tb_id = tb_conditions[0]["condition_id"]
+        ingestion_count_before = store.conn.execute(
+            "SELECT COUNT(*) FROM condition_ingestion_events WHERE patient_id = ?",
+            [patient_id],
+        ).fetchone()[0]
+
+        store.issue_correction(patient_id, condition_ids=[tb_id])
+
+        conditions_after = store.query_current_conditions(patient_id)
+        assert not any(c["condition_id"] == tb_id for c in conditions_after)
+
+        correction_count = store.conn.execute(
+            "SELECT COUNT(*) FROM correction_events WHERE patient_id = ?",
+            [patient_id],
+        ).fetchone()[0]
+        assert correction_count >= 1
+
+        ingestion_count_after = store.conn.execute(
+            "SELECT COUNT(*) FROM condition_ingestion_events WHERE patient_id = ?",
+            [patient_id],
+        ).fetchone()[0]
+        assert ingestion_count_after == ingestion_count_before
+
+    def test_ingestion_event_stats_consistent_with_event_table(
+        self, store, sample_conditions
+    ):
+        """Stats returned by get_ingestion_event_stats must match raw SQL counts."""
+        patient_id = "canonical-test-005"
+        day1 = sample_conditions["day1"]
+
+        store.ingest_raw_batch(patient_id, raw_conditions=day1)
+
+        stats = store.get_ingestion_event_stats(patient_id)
+
+        # Manual count from raw SQL
+        raw_rows = store.conn.execute(
+            """SELECT ingestion_outcome, COUNT(*)
+               FROM condition_ingestion_events
+               WHERE patient_id = ?
+               GROUP BY ingestion_outcome""",
+            [patient_id],
+        ).fetchall()
+        manual_by_outcome = {row[0]: row[1] for row in raw_rows}
+        manual_total = sum(manual_by_outcome.values())
+
+        assert stats["total_attempted"] == manual_total
+        assert stats["by_outcome"] == manual_by_outcome
+        assert stats["parsed"] == manual_by_outcome.get("parsed", 0)
+        assert stats["failed_validation"] == manual_by_outcome.get("failed_validation", 0)
+        # conditions_flagged must be present in the stats dict
+        assert "conditions_flagged" in stats
+
+    def test_non_dict_malformed_payload_is_persisted_not_crashed(self, store):
+        """Non-dict payloads (list, string, None) must not crash ingestion and must be recorded."""
+        patient_id = "canonical-test-006"
+        non_dict_payloads = [
+            ["this", "is", "a", "list"],
+            "just a string",
+            None,
+        ]
+
+        # Must not raise
+        result = store.ingest_raw_batch(patient_id, raw_conditions=non_dict_payloads)
+
+        assert result["conditions_failed"] == 3
+        assert result["conditions_ingested"] == 0
+
+        failed_rows = store.conn.execute(
+            """SELECT ingestion_outcome FROM condition_ingestion_events
+               WHERE patient_id = ? AND ingestion_outcome = 'failed_validation'""",
+            [patient_id],
+        ).fetchall()
+        assert len(failed_rows) == 3
+
+        live = store.query_current_conditions(patient_id)
+        assert len(live) == 0

@@ -250,6 +250,7 @@ class TestHandoutRequirements:
             assert stats["total_attempted"] == len(conditions_data) + 1
             assert stats["failed_validation"] == 1
             assert stats["parsed"] == len(conditions_data)
+            assert "conditions_flagged" in stats
 
             # The result dict surfaces the split so callers can monitor failures
             assert result["conditions_failed"] == 1

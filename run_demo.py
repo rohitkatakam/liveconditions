@@ -5,15 +5,13 @@ Demo: Event Sourcing System for FHIR Condition Data
 This script demonstrates the complete workflow:
 1. Ingest first half of conditions (Day 1)
 2. Query live representation
-3. Ingest second half (Day 2, out of order)
+3. Ingest second half (Day 2)
 4. Query merged state
 5. Issue user correction ("I don't have TB")
 6. Verify correction is reflected in queries while preserving audit trail
 """
 import json
-import uuid
 import logging
-from src.parser import ConditionParser
 from src.storage import ConditionStore
 from src.mcp_tools import ConditionTools
 
@@ -57,22 +55,12 @@ def main():
     print("\n" + "-"*80)
     print("STEP 1: Ingest Day 1 (out of order arrival)")
     print("-"*80)
-    
-    parser_day1 = ConditionParser(patient_id)
-    parse_result = parser_day1.parse_conditions(day1_conditions)
-    print(f"Parsed: {parse_result['parsed']} conditions")
-    print(f"Failed: {parse_result['failed']} conditions")
-    print(f"Flagged for review: {parse_result['flagged']} conditions")
-    
-    extracted_day1 = parser_day1.get_extracted_conditions()
-    
-    batch_id_day1 = uuid.uuid4()
-    store.ingest_batch(
-        batch_id=batch_id_day1,
-        patient_id=patient_id,
-        extracted_conditions=extracted_day1,
-        raw_events=day1_conditions,
-    )
+
+    result_day1_ingest = store.ingest_raw_batch(patient_id, raw_conditions=day1_conditions)
+    stats_day1 = store.get_ingestion_event_stats(patient_id)
+    print(f"Parsed: {stats_day1['parsed']} conditions")
+    print(f"Failed validation: {stats_day1['failed_validation']} conditions")
+    print(f"Flagged for review: {stats_day1['conditions_flagged']} conditions")
     
     # Query after Day 1
     result_day1 = tools.query_conditions(patient_id)
@@ -89,20 +77,10 @@ def main():
     print("\n" + "-"*80)
     print("STEP 2: Ingest Day 2 (arriving out of chronological order)")
     print("-"*80)
-    
-    parser_day2 = ConditionParser(patient_id)
-    parse_result = parser_day2.parse_conditions(day2_conditions)
-    print(f"Parsed: {parse_result['parsed']} conditions")
-    
-    extracted_day2 = parser_day2.get_extracted_conditions()
-    
-    batch_id_day2 = uuid.uuid4()
-    store.ingest_batch(
-        batch_id=batch_id_day2,
-        patient_id=patient_id,
-        extracted_conditions=extracted_day2,
-        raw_events=day2_conditions,
-    )
+
+    store.ingest_raw_batch(patient_id, raw_conditions=day2_conditions)
+    stats_day2 = store.get_ingestion_event_stats(patient_id)
+    print(f"Parsed: {stats_day2['parsed']} conditions total (cumulative)")
     
     # Query after Day 2
     result_day2 = tools.query_conditions(patient_id)
