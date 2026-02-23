@@ -12,7 +12,7 @@ uv sync
 uv run mcp-conditions
 ```
 
-## Run the demo script
+## Run the demo
 
 ```bash
 uv run python run_demo.py
@@ -24,34 +24,43 @@ uv run python run_demo.py
 uv run pytest
 ```
 
-## Ingestion Paths
+---
 
-`store.ingest_raw_batch(patient_id, raw_conditions)` is the **canonical path**: it accepts raw
-FHIR Condition dicts, validates each one internally with Pydantic, and persists every attempt
-(valid or malformed) as an append-only event before projecting only valid conditions into the live
-view — providing complete audit traceability at zero extra caller effort.
+## Architecture
 
-`store.ingest_batch(batch_id, patient_id, extracted_conditions, raw_events)` is a **compatibility
-shim** for callers that pre-parse with `ConditionParser`. New callers should prefer
-`ingest_raw_batch`.
+**Write path** — `ConditionStore.ingest_raw_batch(patient_id, raw_conditions)`
 
-Use `store.get_ingestion_event_stats(patient_id)` to query monitoring data: `total_attempted`,
-`parsed`, `failed_validation`, and `conditions_flagged`.
+Every incoming payload is written to the append-only `condition_ingestion_events` table first. Valid payloads are then projected into `extracted_conditions_staging` for fast reads. Malformed payloads are stored with `ingestion_outcome='failed_validation'` and never appear in query results — providing a full audit trail of what was attempted vs what was accepted.
 
-## Async Background Ingestion
+**Read path** — `ConditionStore.query_current_conditions(patient_id)`
 
-`store.start_background_worker()` enables background ingestion mode. Use `store.enqueue_raw_batch()` to submit batches without blocking the current thread.
+Reads directly from the `current_conditions` view, which joins the staging table against the correction mask. Queries are instant and fully decoupled from ingestion.
+
+**Corrections** — `ConditionStore.issue_correction(patient_id, condition_ids, reason)`
+
+Corrections are appended to `correction_events`. The `current_conditions` view filters them out automatically. Original clinical records are never modified or deleted.
+
+**Background ingestion** — opt-in for latency-sensitive callers
 
 ```python
-store = ConditionStore()
 store.start_background_worker()
-store.enqueue_raw_batch(patient_id, raw_conditions)  # returns immediately
-store.flush_background_ingestion(timeout=10.0)       # wait for all jobs to finish
+store.enqueue_raw_batch(patient_id, raw_conditions)   # returns immediately
+store.flush_background_ingestion(timeout=10.0)        # wait if needed
+status = store.get_background_ingestion_status()      # worker health
 store.stop_background_worker()
 ```
 
-**Fallback to sync:** Pass `fallback_to_sync=True` (default) to `enqueue_raw_batch`. If the worker is not running or the queue is full, the batch is ingested synchronously without data loss.
+Pass `fallback_to_sync=True` (default) to `enqueue_raw_batch` to fall back to synchronous ingestion if the worker is not running.
 
-**Worker health:** Use `store.get_background_ingestion_status()` for queue depth, job counters, and last error. Use `get_ingestion_event_stats(patient_id)` to verify per-patient payload accounting.
+**Monitoring** — `ConditionStore.get_ingestion_event_stats(patient_id)`
 
-**Rollback:** Call `stop_background_worker()` at any time to drain and stop the worker. Subsequent `enqueue_raw_batch(fallback_to_sync=True)` calls fall back to synchronous ingestion transparently.
+Returns `total_attempted`, `parsed`, `failed_validation`, and `conditions_flagged` — directly from the event log.
+
+---
+
+## FastMCP tools
+
+| Tool | Purpose |
+|------|---------|
+| `query_conditions` | RAG tool — returns the cleaned, currently active patient state |
+| `issue_correction` | Mutation tool — appends a correction that masks specified conditions |
