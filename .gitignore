@@ -3,3 +3,7 @@ AGENTS.md
 GUIDELINES.md
 HANDOUT.md
 plans/
+
+.pytest_cache/
+.venv/
+__pycache__/
