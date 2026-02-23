@@ -5,9 +5,8 @@ API notes (mcp>=1.0.0 / FastMCP):
 - app._tool_manager._tools is a dict[str, Tool] of registered tools.
 - app.call_tool(name, args_dict) returns list[TextContent] with JSON payload.
 - app.list_tools() returns list[Tool] (async).
-- run_stdio_async() is the stdio transport entry-point.
+- app.run() is the synchronous stdio transport entry-point used by mcp dev.
 """
-import asyncio
 import logging
 from typing import Optional
 
@@ -90,7 +89,45 @@ def create_mcp_server(
     return app, store
 
 
+def _seed_demo_data(store: ConditionStore, patient_id: str = "demo-patient-001") -> None:
+    """Load conditions.json into the store so the inspector has real data to query."""
+    import json
+    import pathlib
+
+    data_file = pathlib.Path(__file__).parent.parent / "conditions.json"
+    if not data_file.exists():
+        logger.warning("conditions.json not found — inspector will start with empty store")
+        return
+
+    with open(data_file) as f:
+        conditions = json.load(f)
+
+    result = store.ingest_raw_batch(patient_id=patient_id, raw_conditions=conditions)
+    logger.info(
+        "Demo data seeded",
+        extra={
+            "patient_id": patient_id,
+            "ingested": result["conditions_ingested"],
+            "failed": result["conditions_failed"],
+            "flagged": result["conditions_flagged"],
+        },
+    )
+    print(
+        f"[seed] Loaded {result['conditions_ingested']} conditions for patient '{patient_id}' "
+        f"({result['conditions_failed']} failed, {result['conditions_flagged']} flagged)"
+    )
+
+
+# Module-level app instance — used by `mcp dev` / inspector and for direct imports.
+# Seeded immediately so the inspector has real data the moment the module is loaded.
+app, _default_store = create_mcp_server()
+_seed_demo_data(_default_store)
+
+
 def run_server() -> None:
     """Entry-point for `uv run mcp-conditions` CLI script."""
-    app, _store = create_mcp_server()
-    asyncio.run(app.run_stdio_async())
+    app.run()
+
+
+if __name__ == "__main__":
+    app.run()
