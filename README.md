@@ -5,7 +5,7 @@
 - Python 3.13+
 - [`uv`](https://docs.astral.sh/uv/getting-started/installation/) (`pip install uv` or `brew install uv`)
 
-## Setup
+## Setup (first clone this repo)
 
 ```bash
 uv sync --all-extras
