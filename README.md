@@ -1,4 +1,4 @@
-# Lotus Health — FHIR Condition MCP Server
+# Live Conditions + MCP server
 
 ## Prerequisites
 
