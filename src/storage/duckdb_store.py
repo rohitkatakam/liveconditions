@@ -3,7 +3,6 @@ import json
 import logging
 import threading
 import uuid
-from datetime import datetime
 from typing import List, Dict, Any, Optional
 import duckdb
 
@@ -50,7 +49,6 @@ class ConditionStore:
                 validation_flags JSON NOT NULL,
                 ingestion_outcome VARCHAR NOT NULL DEFAULT 'parsed',
                 error_detail JSON,
-                parser_version VARCHAR NOT NULL DEFAULT '1.0',
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -79,7 +77,6 @@ class ConditionStore:
                 condition_id_to_mask VARCHAR NOT NULL,
                 correction_type VARCHAR NOT NULL,
                 correction_reason VARCHAR,
-                target_codes JSON,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -223,7 +220,7 @@ class ConditionStore:
         logger.info("DuckDB schema created successfully")
 
     # -------------------------------------------------------------------------
-    # Private helpers — shared between ingest_batch and ingest_raw_batch
+    # Private helpers
     # -------------------------------------------------------------------------
 
     def _upsert_extracted_condition(
@@ -313,96 +310,6 @@ class ConditionStore:
                     INSERT INTO condition_lineage (patient_id, parent_condition_id, child_condition_id)
                     VALUES (?, ?, ?)
                 """, [patient_id, parent_id, cond_id])
-
-    def ingest_batch(
-        self,
-        batch_id: Optional[uuid.UUID] = None,
-        patient_id: str = None,
-        extracted_conditions: List[ExtractedCondition] = None,
-        raw_events: List[dict] = None,
-    ) -> Dict[str, Any]:
-        """
-        Ingest a batch of pre-parsed conditions: append to events, rebuild derived tables.
-
-        Compatibility path: prefer ``ingest_raw_batch`` for new callers.
-
-        Args:
-            batch_id: UUID for this ingestion batch (auto-generated if not provided)
-            patient_id: Patient identifier
-            extracted_conditions: List of ExtractedCondition objects
-            raw_events: List of raw FHIR Condition dicts (used as raw_payload when provided)
-
-        Returns:
-            Dictionary with ingestion statistics: status, batch_id, patient_id,
-            total, conditions_ingested, conditions_failed, conditions_flagged.
-        """
-        if batch_id is None:
-            batch_id = uuid.uuid4()
-
-        if extracted_conditions is None or not extracted_conditions:
-            logger.warning(f"No conditions to ingest for patient {patient_id}")
-            return {"status": "no_data", "batch_id": str(batch_id)}
-
-        try:
-            # 1. Append to condition_ingestion_events
-            for extracted, raw in zip(
-                extracted_conditions, raw_events or [None] * len(extracted_conditions)
-            ):
-                event_id = uuid.uuid4()
-                flags = extracted.validation_flags if extracted.validation_flags else []
-                raw_payload_json = (
-                    json.dumps(raw) if raw is not None
-                    else json.dumps({"id": extracted.condition_id})
-                )
-                self.conn.execute("""
-                    INSERT INTO condition_ingestion_events (
-                        event_id, ingestion_batch_id, patient_id, condition_id,
-                        raw_payload, validation_flags, ingestion_outcome
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'parsed')
-                """, [
-                    str(event_id), str(batch_id), patient_id,
-                    extracted.condition_id, raw_payload_json, json.dumps(flags),
-                ])
-
-            # 2. Upsert into extracted_conditions_staging
-            for extracted in extracted_conditions:
-                event_result = self.conn.execute("""
-                    SELECT event_id FROM condition_ingestion_events
-                    WHERE patient_id = ? AND condition_id = ?
-                    ORDER BY timestamp DESC LIMIT 1
-                """, [patient_id, extracted.condition_id]).fetchall()
-                last_event_id = event_result[0][0] if event_result else str(uuid.uuid4())
-                self._upsert_extracted_condition(extracted, last_event_id, patient_id)
-
-            # 3. Rebuild lineage
-            self._rebuild_lineage(patient_id)
-
-            logger.info(
-                f"Ingested batch {batch_id}: {len(extracted_conditions)} conditions for patient {patient_id}",
-                extra={
-                    "batch_id": str(batch_id),
-                    "patient_id": patient_id,
-                    "condition_count": len(extracted_conditions),
-                },
-            )
-
-            flagged = sum(1 for c in extracted_conditions if c.validation_flags)
-            return {
-                "status": "success",
-                "batch_id": str(batch_id),
-                "patient_id": patient_id,
-                "total": len(extracted_conditions),
-                "conditions_ingested": len(extracted_conditions),
-                "conditions_failed": 0,
-                "conditions_flagged": flagged,
-            }
-
-        except Exception as e:
-            logger.error(
-                f"Failed to ingest batch {batch_id}: {str(e)}",
-                extra={"batch_id": str(batch_id), "error": str(e)},
-            )
-            raise
 
     def query_current_conditions(
         self,
@@ -679,11 +586,9 @@ class ConditionStore:
 
     def ingest_raw_batch(
         self,
-        patient_id: str = None,
-        raw_conditions: List[dict] = None,
+        patient_id: str,
+        raw_conditions: List[dict],
         batch_id: Optional[uuid.UUID] = None,
-        extracted_conditions: List[ExtractedCondition] = None,
-        raw_events: List[dict] = None,
     ) -> Dict[str, Any]:
         """
         Event-first ingestion: persist every incoming payload (valid or malformed)
@@ -696,17 +601,10 @@ class ConditionStore:
             patient_id: Patient identifier
             raw_conditions: Raw FHIR Condition dicts; may include malformed records
             batch_id: UUID for this batch (auto-generated if not provided)
-            raw_events: Backward-compat alias for raw_conditions
 
         Returns:
             Dictionary with ingestion statistics including failed count
         """
-        # Support legacy raw_events kwarg alias
-        if raw_conditions is None and raw_events is not None:
-            raw_conditions = raw_events
-        if raw_conditions is None:
-            raw_conditions = []
-
         if batch_id is None:
             batch_id = uuid.uuid4()
 

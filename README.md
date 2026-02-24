@@ -1,7 +1,5 @@
 # Lotus Health — FHIR Condition MCP Server
 
-A CQRS-inspired event-sourcing system that ingests FHIR Condition data, reconciles patient state in real time, and exposes it to RAG agents via FastMCP tools.
-
 ## Prerequisites
 
 - Python 3.13+
@@ -82,20 +80,10 @@ Re-run `query_conditions` after — `total_count` will be `104` and `has_correct
 Validate that both required tools are correctly registered, return the expected response contract, and correctly handle the TB correction mutation.
 
 ```bash
-# Both tools are registered on the server
-uv run pytest tests/test_e2e_flow.py::TestMCPTools::test_mcp_server_registers_both_required_tools -v
-
-# query_conditions returns correct shape (status, conditions, total_count, metadata, has_corrections)
-uv run pytest tests/test_e2e_flow.py::TestMCPTools::test_query_conditions_returns_correct_shape -v
-
-# issue_correction masks TB conditions in the live view
-uv run pytest tests/test_e2e_flow.py::TestMCPTools::test_issue_correction_via_tool_masks_tb -v
-
-# Full MCP-focused test suites
-uv run pytest tests/test_e2e_flow.py::TestFastMCPTools tests/test_e2e_flow.py::TestMCPTools -v
+uv run pytest tests/test_e2e_flow.py::TestMCPTools -v
 ```
 
-**Expected outcomes:**
+**Testcases:**
 - `test_mcp_server_registers_both_required_tools` — server exposes both `query_conditions` and `issue_correction`.
 - `test_query_conditions_returns_correct_shape` — read tool returns all required response keys for RAG callers.
 - `test_issue_correction_via_tool_masks_tb` — correction tool appends a masking event; TB is excluded from subsequent queries; `has_corrections` flips to `True`.
@@ -112,11 +100,14 @@ uv run pytest
 
 This is a summary of how this system works, and some testcases that verify certain points made here.
 
+**NOTE:** this diagram does not show *everything* happening, but this is the general data flow
+![system_diagram](system_diagram.png)
+
 ### Write Path — Event-First Ingestion
 
 All incoming FHIR Condition payloads — including malformed ones — are written as immutable rows to `condition_ingestion_events` before any validation result reaches the read model (`ConditionStore.ingest_raw_batch`). Pydantic validates each payload against a typed FHIR `Condition` model; failures are persisted as `failed_validation` events so the system can always answer "what did it ingest and what did it die on." Valid payloads are then projected into `extracted_conditions_staging`.
 
-> **Verify (failed events tracked):** `uv run pytest tests/test_handout_requirements.py::TestHandoutRequirements::test_requirement_monitoring_raw_event_tracing -v`
+> **Verify (failed events tracked):** `uv run pytest tests/test_e2e_flow.py::TestMonitoring::test_failed_payloads_are_recorded_not_projected -v`
 > Injects one malformed payload alongside the real dataset and asserts `failed_validation == 1`, `parsed == 105`, and the malformed record is absent from the live view.
 
 Ingestion can run synchronously or via an opt-in background worker (`start_background_worker` / `enqueue_raw_batch`). If the worker is unavailable or the queue is full, the call falls back to synchronous ingestion transparently — no data loss. This isn't necessary at all for this dataset size, this was more a scalability consideration.
@@ -131,19 +122,19 @@ The read state is a set of DuckDB SQL views over the staging tables. `current_co
 > **Verify (background ingestion doesn't block reads):** `uv run pytest tests/test_e2e_flow.py::TestLatency::test_background_worker_does_not_block_reads -v`
 > Enqueues a full batch on the background worker and immediately queries without flushing; asserts the read returns in under 200 ms.
 
-Reconciliation deduplicates conditions by condition ID and respects FHIR `derived-from` extension lineage tracked in a `condition_lineage` table. Data quality issues (vague onset periods, missing clinical status, non-clinical admin entries, SNOMED/ICD-10 coding gaps) surface as `validation_flags` on each condition rather than causing silent drops.
+FHIR `derived-from` extension lineage is tracked in a `condition_lineage` table. Data quality issues (vague onset periods, missing clinical status, non-clinical admin entries, SNOMED/ICD-10 coding gaps) surface as `validation_flags` on each condition rather than causing silent drops.
 
-> **Verify (data inconsistencies flagged, not dropped):** `uv run pytest tests/test_handout_requirements.py::TestHandoutRequirements::test_requirement_accuracy_data_inconsistencies -v`
+> **Verify (data inconsistencies flagged, not dropped):** `uv run pytest tests/test_e2e_flow.py::TestAccuracy::test_expected_inconsistency_types_are_detected tests/test_pydantic_parser.py::TestValidationFlags -v`
 > Asserts zero parse failures while confirming flags for same-day onset, missing clinical status, non-clinical entries, and lineage relationships.
 
 ### Corrections Path — Append-Only Mutations
 
 User corrections (e.g., "I don't have TB") are appended to `correction_events` via `ConditionStore.issue_correction`. The `correction_mask_current` view aggregates active correction events per condition ID, and `current_conditions` left-joins against this mask to exclude any masked condition. Original clinician records in `condition_ingestion_events` and `extracted_conditions_staging` are never modified or deleted — full audit trail is preserved.
 
-> **Verify (original data preserved after correction):** `uv run pytest tests/test_e2e_flow.py::TestUserCorrections::test_original_data_preserved_after_correction -v`
+> **Verify (original data preserved after correction):** `uv run pytest tests/test_e2e_flow.py::TestLiveRepresentation::test_correction_preserves_original_events -v`
 > Issues a correction and asserts the raw `condition_ingestion_events` count is unchanged before and after.
 
-> **Verify (TB removed from live view):** `uv run pytest tests/test_handout_requirements.py::TestHandoutRequirements::test_requirement_tuberculosis_correction -v`
+> **Verify (TB removed from live view):** `uv run pytest tests/test_e2e_flow.py::TestLiveRepresentation::test_tuberculosis_correction_masks_live_view -v`
 
 ### MCP Interface — FastMCP Tools
 
@@ -156,8 +147,14 @@ Two FastMCP tools are registered in `src/mcp_server.py`:
 
 ### Monitoring
 
-- `get_ingestion_event_stats(patient_id)` — per-patient breakdown of `total_attempted`, `parsed`, `failed_validation`, and `conditions_flagged` from the raw event log.
-- `get_background_ingestion_status()` — worker health snapshot: `worker_running`, `queue_depth`, `jobs_enqueued`, `jobs_processed`, `jobs_failed`, `last_error`, `last_processed_at`.
-- All ingestion and correction paths emit structured JSON log events at `INFO` and `WARNING` levels.
+- `get_ingestion_event_stats(patient_id)` provides payload accounting from the immutable event log:
+  `total_attempted`, `parsed`, `failed_validation`, `conditions_flagged`.
 
-> **Verify (monitoring fields present and accurate):** `uv run pytest tests/test_handout_requirements.py::TestHandoutRequirements::test_requirement_monitoring tests/test_handout_requirements.py::TestBackgroundObservability -v`
+- `get_background_ingestion_status()` provides worker health:
+  `worker_running`, `queue_depth`, `jobs_enqueued`, `jobs_processed`, `jobs_failed`, `last_error`, `last_processed_at`.
+
+- Quick rule of thumb: `total_attempted == parsed + failed_validation`; rising `queue_depth` with flat `jobs_processed` indicates ingestion lag.
+
+> **Verify (event-level monitoring correctness):** `uv run pytest tests/test_e2e_flow.py::TestMonitoring -v`
+
+> **Verify (worker health snapshot fields):** `uv run pytest tests/test_e2e_flow.py::TestLatency::test_background_worker_health_is_observable -v`
